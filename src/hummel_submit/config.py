@@ -112,7 +112,12 @@ def _expand_path(value: str, project_dir: Path, *, relative_to_project: bool = T
     return str(path.resolve(strict=False))
 
 
-def load_config(project_dir: Path, cli_overrides: dict[str, dict[str, Any]] | None = None) -> tuple[dict[str, Any], list[Path]]:
+def load_config(
+    project_dir: Path,
+    cli_overrides: dict[str, dict[str, Any]] | None = None,
+    *,
+    require_command: bool = True,
+) -> tuple[dict[str, Any], list[Path]]:
     project_dir = project_dir.resolve()
     config = copy.deepcopy(DEFAULTS)
     sources: list[Path] = []
@@ -147,16 +152,18 @@ def load_config(project_dir: Path, cli_overrides: dict[str, dict[str, Any]] | No
     if exe.get("apptainer"):
         exe["apptainer"] = _expand_path(str(exe["apptainer"]), project_dir)
 
-    validate_config(config)
+    validate_config(config, require_command=require_command)
     return config, sources
 
 
-def validate_config(config: dict[str, Any]) -> None:
+def validate_config(config: dict[str, Any], *, require_command: bool = True) -> None:
     exe = config["execution"]
     slurm = config["slurm"]
 
     if not isinstance(exe["command"], list) or not all(isinstance(x, str) and x for x in exe["command"]):
-        raise ConfigError("[execution].command must be a non-empty array of strings")
+        raise ConfigError("[execution].command must be an array of non-empty strings")
+    if require_command and not exe["command"]:
+        raise ConfigError("[execution].command must not be empty when submitting")
     if not isinstance(exe["auto_args"], list) or not all(isinstance(x, str) for x in exe["auto_args"]):
         raise ConfigError("[execution].auto_args must be an array of strings")
     if not isinstance(exe["binds"], list) or not all(isinstance(x, str) and x for x in exe["binds"]):

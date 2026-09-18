@@ -4,6 +4,7 @@ import glob
 import os
 from pathlib import Path
 import shutil
+import shlex
 import signal
 import subprocess
 import time
@@ -121,7 +122,7 @@ def run_payload(state: dict[str, Any], state_path: Path, hop: int) -> tuple[int,
     elif resuming and state["config"]["execution"]["checkpoint_glob"]:
         log("WARNING: no checkpoint found in this run directory; starting this hop without one")
     log(f"GPUs visible={ngpu}, strategy={strategy}")
-    log("running: " + " ".join(command))
+    log("running: " + shlex.join(command))
 
     proc_cmd, env = make_process_command(state, command, ngpu)
     timed_out = False

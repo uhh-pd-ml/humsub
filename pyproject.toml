@@ -11,7 +11,6 @@ requires-python = ">=3.11"
 authors = [
   {name = "Kasieczka group"},
 ]
-license = {text = "MIT"}
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",

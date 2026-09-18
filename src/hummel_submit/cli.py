@@ -10,7 +10,7 @@ from typing import Any
 from . import __version__
 from .config import ConfigError, PROJECT_CONFIG_NAME, USER_CONFIG, config_as_json, load_config, validate_run_name
 from .slurm import SlurmError, cancel_jobs, queue_status, sbatch_command, submit
-from .state import atomic_write_json, chain_root, create_state, default_run_name, done_marker, load_state
+from .state import append_job, chain_root, create_state, default_run_name, done_marker, load_state, mark_status
 from .templates import PROJECT_TEMPLATE, USER_TEMPLATE
 
 
@@ -92,7 +92,7 @@ def _print_config(config: dict[str, Any], sources: list[Path]) -> None:
 
 
 def cmd_config(args: argparse.Namespace) -> int:
-    config, sources = load_config(Path.cwd())
+    config, sources = load_config(Path.cwd(), require_command=False)
     if args.json:
         print(config_as_json(config))
     else:
@@ -172,11 +172,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         shutil.rmtree(Path(state["run_dir"]), ignore_errors=True)
         raise
 
-    state = load_state(state_path)
-    state["jobs"].append(job_id)
-    state["last_job_id"] = job_id
-    state["status"] = "queued"
-    atomic_write_json(state_path, state)
+    state = append_job(state_path, job_id)
     print(f"[submit] submitted job {job_id}")
     print(f"[submit] chain id    {state['chain_id']}")
     print(f"[submit] state       {state_path}")
@@ -185,7 +181,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
 
 def _find_chain(chain: str) -> Path:
-    config, _ = load_config(Path.cwd())
+    config, _ = load_config(Path.cwd(), require_command=False)
     root = chain_root(Path(config["execution"]["output_dir"]))
     direct = root / chain / "state.json"
     if direct.exists():
@@ -223,8 +219,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     path = _find_chain(args.chain)
     state = load_state(path)
     done_marker(path).write_text("cancelled-by-user\n", encoding="utf-8")
-    state["status"] = "cancelled-by-user"
-    atomic_write_json(path, state)
+    state = mark_status(path, "cancelled-by-user")
     cancel_jobs(state["jobs"])
     print(f"marked chain {state['chain_id']} done and requested cancellation of {len(state['jobs'])} known job(s)")
     return 0
@@ -232,6 +227,11 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    commands = {"init", "config", "submit", "status", "cancel"}
+    top_level = {"-h", "--help", "--version"}
+    if argv and argv[0] not in commands and argv[0] not in top_level:
+        argv.insert(0, "submit")
     args = parser.parse_args(argv)
     try:
         if args.subcommand == "init":

@@ -105,6 +105,13 @@ Prefer `--key=value` in `auto_args`. A user-supplied argument with the same `--k
 hummel-submit submit -- --epochs=100 --learning-rate=1e-3
 ```
 
+For convenience, `submit` is also the implicit default, so the old launcher-like form works:
+
+```bash
+hummel-submit --dry-run -- --epochs=100
+hummel-submit --no-resubmit -- --smoke-test
+```
+
 Useful one-off overrides:
 
 ```bash
@@ -177,6 +184,42 @@ source /sw/batch/init.sh
 ```
 
 before any other command, as required on Hummel-2. It then executes the frozen Python worker snapshot. No `srun` is used.
+
+
+## Migration from the original shell launcher
+
+The main settings map directly:
+
+| Original shell setting | New TOML setting |
+| --- | --- |
+| `IMAGE` | `execution.image` |
+| `OUTPUT_DIR` | `execution.output_dir` |
+| `COMMAND=(...)` | `execution.command = [...]` |
+| `AUTO_ARGS=(...)` | `execution.auto_args = [...]` |
+| `CKPT_GLOB` | `execution.checkpoint_glob` |
+| `ENV_FILE` | `execution.env_file` |
+| `BINDS` | `execution.binds` |
+| `ACCOUNT` | `slurm.account` |
+| `MAIL` | `slurm.mail` |
+| `RESERVATION` | `slurm.reservation` |
+| `TIME_LIMIT` | `slurm.time_limit` |
+| `MAX_HOPS` | `slurm.max_hops` |
+| `SBATCH_ARGS` | `slurm.extra_args` |
+
+There is intentionally no `RUN_NAME_CMD` equivalent. Run names are generated without `eval`; use `hummel-submit submit --run-name NAME` when an explicit name is needed.
+
+For the short `gputest` setup described by the old launcher, the equivalent project override is, for example:
+
+```toml
+[slurm]
+partition = "gputest"
+time_limit = "00:10:00"
+signal_seconds = 60
+gpus_per_node = 0
+extra_args = ["--cpus-per-task=8"]
+```
+
+The group reservation remains opt-in: leaving `reservation = ""` does not pin a job to `g002`; `extra_args = ["--exclude=g002"]` remains available for long runs that should stay off it.
 
 ## Development
 

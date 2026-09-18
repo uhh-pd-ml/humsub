@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import fcntl
 import json
 from pathlib import Path
 import shutil
@@ -88,21 +89,34 @@ def create_state(
     return data, path
 
 
-def append_job(path: Path, job_id: str) -> dict[str, Any]:
-    data = load_state(path)
-    if job_id not in data["jobs"]:
-        data["jobs"].append(job_id)
-    data["last_job_id"] = job_id
-    atomic_write_json(path, data)
+def _locked_update(path: Path, update: Any) -> dict[str, Any]:
+    lock_path = path.parent / ".state.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        data = load_state(path)
+        update(data)
+        atomic_write_json(path, data)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     return data
+
+
+def append_job(path: Path, job_id: str) -> dict[str, Any]:
+    """Append a job id without losing a concurrent update from a fast-starting worker."""
+    def update(data: dict[str, Any]) -> None:
+        if job_id not in data["jobs"]:
+            data["jobs"].append(job_id)
+        data["last_job_id"] = job_id
+        if data.get("status") == "submitted":
+            data["status"] = "queued"
+    return _locked_update(path, update)
 
 
 def mark_status(path: Path, status: str, **fields: Any) -> dict[str, Any]:
-    data = load_state(path)
-    data["status"] = status
-    data.update(fields)
-    atomic_write_json(path, data)
-    return data
+    def update(data: dict[str, Any]) -> None:
+        data["status"] = status
+        data.update(fields)
+    return _locked_update(path, update)
 
 
 def done_marker(path: Path) -> Path:
