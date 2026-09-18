@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hummel-submit"
+version = "0.1.0"
+description = "Safe, project-configurable SLURM submission helper for Hummel-2"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  {name = "Kasieczka group"},
+]
+license = {text = "MIT"}
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.scripts]
+hummel-submit = "hummel_submit.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hummel_submit = ["worker.sh"]
