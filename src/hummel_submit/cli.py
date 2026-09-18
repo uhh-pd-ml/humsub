@@ -16,7 +16,7 @@ from .templates import PROJECT_TEMPLATE, USER_TEMPLATE
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="hummel-submit", description="Hummel-2 SLURM submission helper")
+    parser = argparse.ArgumentParser(prog="humsub", description="Hummel-2 SLURM submission helper")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
@@ -209,7 +209,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     print(f"[submit] submitted job {job_id}")
     print(f"[submit] chain id    {state['chain_id']}")
     print(f"[submit] state       {state_path}")
-    print(f"[submit] cancel with hummel-submit cancel {state['chain_id']}")
+    print(f"[submit] cancel with humsub cancel {state['chain_id']}")
     return 0
 
 
@@ -279,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_cancel(args)
         parser.error("unknown command")
     except (ConfigError, PathCheckError, SlurmError, OSError, ValueError) as exc:
-        print(f"hummel-submit: error: {exc}", file=sys.stderr)
+        print(f"humsub: error: {exc}", file=sys.stderr)
         return 2
     return 0
 

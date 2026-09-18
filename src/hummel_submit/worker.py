@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     slurm = cfg["slurm"]
     job_id = os.environ.get("SLURM_JOB_ID")
     if not job_id:
-        print("hummel-submit worker must run inside a SLURM job", file=sys.stderr)
+        print("humsub worker must run inside a SLURM job", file=sys.stderr)
         return 2
 
     state = append_job(state_path, job_id)

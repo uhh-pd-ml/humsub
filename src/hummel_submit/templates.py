@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-PROJECT_TEMPLATE = r'''# Project-specific settings for hummel-submit.
+PROJECT_TEMPLATE = r'''# Project-specific settings for humsub.
 # Commit this file with the project if these settings are shared by collaborators.
 
 [execution]
@@ -49,13 +49,13 @@ retry_on_failure = false
 extra_args = []
 
 [validation]
-# hummel-submit automatically recognizes common output/path option names. Add
+# humsub automatically recognizes common output/path option names. Add
 # project-specific options here when their values must be writable in batch jobs.
 # Example: writable_args = ["--tensorboard-dir", "--artifact-path"]
 writable_args = []
 '''
 
-USER_TEMPLATE = r'''# Personal fallback settings for hummel-submit.
+USER_TEMPLATE = r'''# Personal fallback settings for humsub.
 # Project .hummel-submit.toml settings override these values.
 
 [execution]

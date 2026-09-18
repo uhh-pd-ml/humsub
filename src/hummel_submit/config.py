@@ -112,7 +112,7 @@ def _expand_path(value: str, project_dir: Path, *, relative_to_project: bool = T
     if unresolved:
         raise ConfigError(
             f"path contains unresolved environment variable {unresolved.group(0)!r}; "
-            "run hummel-submit from a Hummel-2 frontend or define the variable explicitly"
+            "run humsub from a Hummel-2 frontend or define the variable explicitly"
         )
     if not value:
         return value
@@ -221,7 +221,7 @@ def _validate_extra_args(args: list[str]) -> None:
             )
         if option in _RESERVED_SBATCH_OPTIONS:
             raise ConfigError(
-                f"{option} is managed by hummel-submit; set the corresponding [slurm] option instead"
+                f"{option} is managed by humsub; set the corresponding [slurm] option instead"
             )
 
 

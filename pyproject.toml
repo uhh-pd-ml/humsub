@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hummel-submit"
-version = "0.2.0"
+version = "0.2.1"
 description = "Safe, project-configurable SLURM submission helper for Hummel-2"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,7 +18,7 @@ classifiers = [
 ]
 
 [project.scripts]
-hummel-submit = "hummel_submit.cli:main"
+humsub = "hummel_submit.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

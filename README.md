@@ -1,4 +1,4 @@
-# hummel-submit
+# hummel-submit (`humsub`)
 
 A small, standard-library-only Python helper for submitting restartable jobs on the UHH Hummel-2 cluster.
 
@@ -26,17 +26,17 @@ A lightweight installation is:
 python3 -m venv "$USW/venvs/hummel-submit"
 "$USW/venvs/hummel-submit/bin/pip" install .
 mkdir -p "$HOME/.local/bin"
-ln -sf "$USW/venvs/hummel-submit/bin/hummel-submit" "$HOME/.local/bin/hummel-submit"
+ln -sf "$USW/venvs/hummel-submit/bin/humsub" "$HOME/.local/bin/humsub"
 ```
 
-The Python interpreter used to invoke `hummel-submit` must be visible at the same absolute path on compute nodes. `/usw` is read-only there, which is fine for an interpreter and installed package.
+The Python interpreter used to invoke `humsub` must be visible at the same absolute path on compute nodes. `/usw` is read-only there, which is fine for an interpreter and installed package.
 
 ## First-time setup
 
 Run in a project directory:
 
 ```bash
-hummel-submit init
+humsub init
 ```
 
 This creates, without overwriting existing files:
@@ -49,7 +49,7 @@ Precedence is built-in defaults → personal config → project config → selec
 Show the resolved configuration with:
 
 ```bash
-hummel-submit config
+humsub config
 ```
 
 ## Hummel-2 storage model
@@ -123,7 +123,7 @@ Available `auto_args` placeholders are `{RUN}`, `{RUN_DIR}`, `{NGPU}`, `{STRATEG
 
 ## Submission-time path validation
 
-Before calling `sbatch`, `hummel-submit` validates paths that it knows must be writable and performs a conservative scan of path-like payload arguments.
+Before calling `sbatch`, `humsub` validates paths that it knows must be writable and performs a conservative scan of path-like payload arguments.
 
 It always checks `execution.output_dir` and `execution.cache_dir`. `/home` and `/usw` are hard errors for write targets because both are read-only in Hummel batch jobs. The persistent output directory must also be shared across hops, so `/tmp`, `/dev/shm`, Hummel-managed temporary BeeGFS directories and node-specific NVMe-oF storage are rejected for `output_dir`.
 
@@ -140,16 +140,16 @@ Example:
 
 ```bash
 # rejected: /home is writable on the frontend but read-only in the batch job
-hummel-submit -- --output-dir="$HOME/results"
+humsub -- --output-dir="$HOME/results"
 
 # accepted: existing input under /home is read-only but readable
-hummel-submit -- --input="$HOME/config/model.yaml" --output-dir="$BEEGFS/jobs/result"
+humsub -- --input="$HOME/config/model.yaml" --output-dir="$BEEGFS/jobs/result"
 ```
 
 The check is intentionally not a security boundary and cannot understand arbitrary application semantics or every container-internal path. For an exceptional setup, bypass only the preflight check with:
 
 ```bash
-hummel-submit --skip-path-checks -- --some-special-path=/custom/location
+humsub --skip-path-checks -- --some-special-path=/custom/location
 ```
 
 `--dry-run` still performs path validation, making it useful as a preflight command.
@@ -157,23 +157,23 @@ hummel-submit --skip-path-checks -- --some-special-path=/custom/location
 ## Submitting
 
 ```bash
-hummel-submit submit -- --epochs=100 --learning-rate=1e-3
+humsub submit -- --epochs=100 --learning-rate=1e-3
 ```
 
 For convenience, `submit` is the implicit default:
 
 ```bash
-hummel-submit --dry-run -- --epochs=100
-hummel-submit --no-resubmit -- --smoke-test
+humsub --dry-run -- --epochs=100
+humsub --no-resubmit -- --smoke-test
 ```
 
 Useful one-off overrides include:
 
 ```bash
-hummel-submit submit --time 12:00:00 -- --epochs=100
-hummel-submit submit --reservation kasieczka -- --epochs=2
-hummel-submit submit --sbatch-arg=--exclude=g002 -- --epochs=100
-hummel-submit submit --no-resubmit -- --smoke-test
+humsub submit --time 12:00:00 -- --epochs=100
+humsub submit --reservation kasieczka -- --epochs=2
+humsub submit --sbatch-arg=--exclude=g002 -- --epochs=100
+humsub submit --no-resubmit -- --smoke-test
 ```
 
 Account, partition, time, reservation and GPU count belong in TOML. `slurm.extra_args` / `--sbatch-arg` remain an escape hatch for options such as `--cpus-per-task`, `--constraint`, and `--exclude`. Options that would break chain invariants (`--export`, `--dependency`, `--signal`, etc.) are rejected there.
@@ -196,8 +196,8 @@ A failed hop then continues only if a checkpoint exists.
 Submission prints a chain id. Inspect or cancel it with:
 
 ```bash
-hummel-submit status 20260918-140501-a1b2c3d4
-hummel-submit cancel 20260918-140501-a1b2c3d4
+humsub status 20260918-140501-a1b2c3d4
+humsub cancel 20260918-140501-a1b2c3d4
 ```
 
 A SLURM job id belonging to the chain can also be supplied. A plain `scancel <current-job>` is safe: the waiting follower wakes without a continuation marker, marks the chain stopped, and exits without launching the payload.
@@ -238,7 +238,7 @@ before executing the frozen worker. No `srun` is used.
 | `MAX_HOPS` | `slurm.max_hops` |
 | `SBATCH_ARGS` | `slurm.extra_args` |
 
-There is intentionally no `RUN_NAME_CMD` equivalent. Run names are generated without `eval`; use `hummel-submit submit --run-name NAME` when an explicit name is needed.
+There is intentionally no `RUN_NAME_CMD` equivalent. Run names are generated without `eval`; use `humsub submit --run-name NAME` when an explicit name is needed.
 
 For the short `gputest` setup from the old launcher, for example:
 
