@@ -28,13 +28,15 @@ def base_sbatch_args(state: dict[str, Any]) -> list[str]:
         f"--account={slurm['account']}",
         f"--partition={slurm['partition']}",
         f"--nodes={slurm['nodes']}",
-        f"--gpus={slurm['gpus']}",
         f"--time={slurm['time_limit']}",
         "--export=NONE",
-        f"--signal=B:USR1@{slurm['signal_seconds']}",
         f"--chdir={state['project_dir']}",
         f"--output={output_dir / 'logs' / '%x_%j.log'}",
     ]
+    if slurm["gpus"] > 0:
+        args.append(f"--gpus={slurm['gpus']}")
+    if state.get("resubmit", True) and slurm.get("max_hops", 2) > 1:
+        args.append(f"--signal=B:USR1@{slurm['signal_seconds']}")
     if slurm["mail"]:
         args += [f"--mail-user={slurm['mail']}", "--mail-type=FAIL"]
     if slurm["reservation"]:
