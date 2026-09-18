@@ -6,34 +6,30 @@ It replaces the pattern of copying and editing a large submission shell script. 
 
 ## Design goals
 
-- Hummel-2 rules stay in one maintained implementation: `--export=NONE`, `/sw/batch/init.sh` first in the batch worker, and no `srun`.
-- Personal defaults and project settings are separate.
-- A chain uses a frozen snapshot of **both its resolved configuration and the installed worker code**, so edits/upgrades do not change a run halfway through.
-- Every follower gets the same frozen SLURM options, rather than reconstructing only a subset of the first job's resources.
-- A follower starts useful work only after the previous hop explicitly writes a continuation marker on `SIGUSR1`. Plain `scancel`, startup failures, and ordinary program failures therefore do not silently restart the job.
-- Checkpoint discovery is restricted to the unique run directory.
-- Application failures stop by default. Optional retry-on-failure is explicit and requires an existing checkpoint.
-- No shell parsing is used for the payload command or SLURM extra arguments.
+- Keep Hummel-2 rules in one maintained implementation: `--export=NONE`, `/sw/batch/init.sh` first in the batch worker, and no `srun`.
+- Separate personal defaults from project settings.
+- Freeze both the resolved configuration and the worker code for each chain so edits/upgrades cannot change a run halfway through.
+- Replay the same frozen SLURM options on every follower.
+- Continue a chain only after the previous hop explicitly requests continuation on SLURM's pre-timeout `USR1` signal.
+- Scope checkpoint discovery to the unique run directory.
+- Stop on ordinary application failures by default; retrying is explicit.
+- Follow Hummel-2 storage policy and catch common invalid paths before submission.
+- Avoid shell parsing for payload commands and SLURM extra arguments.
 
 ## Installation
 
-Requires Python 3.11 or newer (Debian 12 provides Python 3.11).
+Requires Python 3.11 or newer. Hummel-2 documentation recommends installing downloaded Python software under `$USW`, because `/home` is for user-authored files and `/usw` is specifically intended for reinstallable software.
 
-From this repository:
-
-```bash
-python3 -m pip install --user .
-```
-
-or, in a virtual environment:
+A lightweight installation is:
 
 ```bash
-python3 -m venv ~/.venvs/hummel-submit
-~/.venvs/hummel-submit/bin/pip install .
-ln -s ~/.venvs/hummel-submit/bin/hummel-submit ~/.local/bin/hummel-submit
+python3 -m venv "$USW/venvs/hummel-submit"
+"$USW/venvs/hummel-submit/bin/pip" install .
+mkdir -p "$HOME/.local/bin"
+ln -sf "$USW/venvs/hummel-submit/bin/hummel-submit" "$HOME/.local/bin/hummel-submit"
 ```
 
-The Python interpreter used to invoke `hummel-submit` must be available at the same absolute path on the compute nodes. The package itself is snapshotted into each chain, so upgrading/reinstalling it while a chain is running is safe.
+The Python interpreter used to invoke `hummel-submit` must be visible at the same absolute path on compute nodes. `/usw` is read-only there, which is fine for an interpreter and installed package.
 
 ## First-time setup
 
@@ -48,13 +44,7 @@ This creates, without overwriting existing files:
 - `~/.config/hummel-submit/config.toml` — personal fallback settings
 - `./.hummel-submit.toml` — project-specific settings
 
-Precedence is:
-
-1. built-in defaults
-2. personal config
-3. project config
-4. selected `HUMMEL_*` environment overrides
-5. explicit submit CLI overrides
+Precedence is built-in defaults → personal config → project config → selected `HUMMEL_*` environment overrides → explicit submit CLI overrides.
 
 Show the resolved configuration with:
 
@@ -62,11 +52,43 @@ Show the resolved configuration with:
 hummel-submit config
 ```
 
+## Hummel-2 storage model
+
+The defaults intentionally use Hummel's environment variables rather than spelling out paths. This avoids hard-coding an SSD number or the current directory layout.
+
+```text
+$HOME       source/config written by the user; backed up; READ-ONLY in batch jobs
+$USW        installed software/containers;          READ-ONLY in batch jobs
+$BEEGFS     large persistent data/checkpoints/logs; writable, good streaming I/O
+$SSD        small-file/random-I/O scratch/caches;    writable, no backup/redundancy
+/tmp        per-job RAM filesystem;                  writable, counts as job memory
+/dev/shm    per-job RAM filesystem;                  writable, counts as job memory
+```
+
+Accordingly, the default user config is essentially:
+
+```toml
+[execution]
+output_dir = "${BEEGFS}/jobs"
+cache_dir = "${SSD}/.hummel-submit/cache"
+binds = ["${BEEGFS}", "${USW}", "${SSD}"]
+```
+
+Large run results and checkpoints go to BeeGFS. Matplotlib, Triton and TorchInductor caches use a per-job directory under `cache_dir`; this directory is removed when the payload exits. The helper does **not** put those caches in `/tmp`, because Hummel-2 implements `/tmp` and `/dev/shm` as RAM-backed job-private filesystems.
+
+The project itself may live under `$HOME`; it only needs to be read there. A batch payload should write results to `{RUN_DIR}` or another writable `$BEEGFS`/`$SSD` location rather than creating files next to the source checkout.
+
+Relevant RRZ documentation:
+
+- https://www.rrz.uni-hamburg.de/en/services/hpc/hummel2-2024/data.html
+- https://www.rrz.uni-hamburg.de/en/services/hpc/hummel2-2024/data/tmpdir.html
+- https://www.rrz.uni-hamburg.de/en/services/hpc/hummel2-2024/batch.html
+
 ## Example project config
 
 ```toml
 [execution]
-image = "/usw/u/${USER}/singularity_images/myproject-latest.sif"
+image = "${USW}/containers/myproject-latest.sif"
 command = ["my-train"]
 auto_args = [
   "--run={RUN}",
@@ -81,23 +103,56 @@ env_file = ".env"
 job_name = "training"
 partition = "gpu"
 nodes = 1
-gpus_per_node = 1
+gpus = 1
 time_limit = "4:00:00"
 max_hops = 20
-extra_args = ["--cpus-per-task=8", "--mem=64G"]
+extra_args = ["--cpus-per-task=8"]
+
+[validation]
+# Add application-specific options whose values are known to be write targets.
+# Common names such as --output, --output-dir, --save-dir, --log-file, etc.
+# are recognized automatically.
+writable_args = ["--tensorboard-dir"]
 ```
 
-`checkpoint_glob` is deliberately relative to `$OUTPUT_DIR/runs/<run-name>/`; absolute paths and `..` are rejected so one run cannot accidentally resume another run's checkpoint.
+Hummel-2 determines GPU virtual-node allocation with `--gpus`; the helper therefore emits that form. Explicit SLURM memory requests such as `--mem`, `--mem-per-cpu` and `--mem-per-gpu` are rejected because Hummel-2 policy says memory must not be requested directly.
 
-Available `auto_args` placeholders are:
+`checkpoint_glob` is relative to `$OUTPUT_DIR/runs/<run-name>/`; absolute paths and `..` are rejected so one run cannot accidentally resume another run's checkpoint.
 
-- `{RUN}`: unique run name
-- `{RUN_DIR}`: unique absolute run directory
-- `{NGPU}`: GPUs visible to the payload
-- `{STRATEGY}`: `ddp` for more than one visible GPU, otherwise `auto`
-- `{CKPT}`: newest checkpoint, or the literal `null`
+Available `auto_args` placeholders are `{RUN}`, `{RUN_DIR}`, `{NGPU}`, `{STRATEGY}`, and `{CKPT}`. Prefer `--key=value` in `auto_args`: a user-supplied argument with the same `--key` after `--` suppresses the automatic one.
 
-Prefer `--key=value` in `auto_args`. A user-supplied argument with the same `--key` after `--` suppresses the automatic one.
+## Submission-time path validation
+
+Before calling `sbatch`, `hummel-submit` validates paths that it knows must be writable and performs a conservative scan of path-like payload arguments.
+
+It always checks `execution.output_dir` and `execution.cache_dir`. `/home` and `/usw` are hard errors for write targets because both are read-only in Hummel batch jobs. The persistent output directory must also be shared across hops, so `/tmp`, `/dev/shm`, Hummel-managed temporary BeeGFS directories and node-specific NVMe-oF storage are rejected for `output_dir`.
+
+For application arguments, the helper cannot generally know whether a path is an input or output. The policy is therefore deliberately conservative:
+
+- an existing path is treated as an input unless its option name is clearly output-like;
+- a nonexistent path is treated as something the job is likely to create and is checked for compute-node writability;
+- common output names such as `--output`, `--output-dir`, `--save-dir`, `--checkpoint-path`, `--log-file`, `--cache-dir`, and variants with `_` are recognized automatically;
+- additional project-specific write options can be declared in `[validation].writable_args`;
+- existing symlink prefixes are resolved before classifying the filesystem;
+- an unrecognized filesystem produces a warning when the submission-node permissions look plausible, because the helper cannot prove its compute-node visibility.
+
+Example:
+
+```bash
+# rejected: /home is writable on the frontend but read-only in the batch job
+hummel-submit -- --output-dir="$HOME/results"
+
+# accepted: existing input under /home is read-only but readable
+hummel-submit -- --input="$HOME/config/model.yaml" --output-dir="$BEEGFS/jobs/result"
+```
+
+The check is intentionally not a security boundary and cannot understand arbitrary application semantics or every container-internal path. For an exceptional setup, bypass only the preflight check with:
+
+```bash
+hummel-submit --skip-path-checks -- --some-special-path=/custom/location
+```
+
+`--dry-run` still performs path validation, making it useful as a preflight command.
 
 ## Submitting
 
@@ -105,90 +160,67 @@ Prefer `--key=value` in `auto_args`. A user-supplied argument with the same `--k
 hummel-submit submit -- --epochs=100 --learning-rate=1e-3
 ```
 
-For convenience, `submit` is also the implicit default, so the old launcher-like form works:
+For convenience, `submit` is the implicit default:
 
 ```bash
 hummel-submit --dry-run -- --epochs=100
 hummel-submit --no-resubmit -- --smoke-test
 ```
 
-Useful one-off overrides:
+Useful one-off overrides include:
 
 ```bash
 hummel-submit submit --time 12:00:00 -- --epochs=100
 hummel-submit submit --reservation kasieczka -- --epochs=2
 hummel-submit submit --sbatch-arg=--exclude=g002 -- --epochs=100
 hummel-submit submit --no-resubmit -- --smoke-test
-hummel-submit submit --dry-run -- --epochs=100
 ```
 
-Common resource settings such as account, partition, time, reservation and GPU count belong in the TOML config. `slurm.extra_args` / `--sbatch-arg` are an escape hatch for options such as `--mem`, `--cpus-per-task`, `--constraint` and `--exclude`. Options that would break chain invariants (`--export`, `--dependency`, `--signal`, etc.) are rejected there.
+Account, partition, time, reservation and GPU count belong in TOML. `slurm.extra_args` / `--sbatch-arg` remain an escape hatch for options such as `--cpus-per-task`, `--constraint`, and `--exclude`. Options that would break chain invariants (`--export`, `--dependency`, `--signal`, etc.) are rejected there.
 
-### Courtesy slicing
+### Courtesy slicing and failures
 
-For long training on shared GPUs, use e.g. `time_limit = "4:00:00"` or `"12:00:00"`. Each hop pre-queues an `afterany` follower, but that follower checks for a continuation marker written only when the current hop receives SLURM's pre-timeout `USR1` signal. The follower then goes through the scheduler again and resumes from the newest checkpoint.
+For long training on shared GPUs, use e.g. `time_limit = "4:00:00"` or `"12:00:00"`. Each hop pre-queues an `afterany` follower, but that follower starts useful work only if the preceding hop wrote a continuation marker after receiving the pre-timeout `USR1` signal. A plain `scancel`, startup failure, or ordinary application failure therefore does not silently restart the workload.
 
-An intentional time-slice handoff exits the batch worker successfully, so `--mail-type=FAIL` does not generate a failure email at every slice.
-
-### Failures
-
-By default, a nonzero application exit stops the chain and cancels the queued follower. This avoids repeating deterministic failures across all hops.
-
-If a project explicitly wants retry behavior:
+By default a nonzero application exit stops the chain and cancels its waiting follower. Projects that explicitly want retry behavior can set:
 
 ```toml
 [slurm]
 retry_on_failure = true
 ```
 
-A failed hop will then continue only if a checkpoint already exists.
+A failed hop then continues only if a checkpoint exists.
 
 ## Cancelling and inspecting a chain
 
-Submission prints a chain id:
-
-```text
-[submit] chain id    20260918-140501-a1b2c3d4
-```
-
-Inspect it with:
+Submission prints a chain id. Inspect or cancel it with:
 
 ```bash
 hummel-submit status 20260918-140501-a1b2c3d4
-```
-
-and cancel the entire chain with:
-
-```bash
 hummel-submit cancel 20260918-140501-a1b2c3d4
 ```
 
-A SLURM job id belonging to the chain can also be supplied instead of the chain id.
-
-A plain `scancel <current-job>` is no longer dangerous: because no continuation marker is written, the already queued follower wakes only to mark the chain stopped and exit without launching the payload.
+A SLURM job id belonging to the chain can also be supplied. A plain `scancel <current-job>` is safe: the waiting follower wakes without a continuation marker, marks the chain stopped, and exits without launching the payload.
 
 ## Environment file
 
-`env_file` is parsed as simple dotenv-style `KEY=VALUE` data. Blank lines, `#` comments, optional `export`, and simple single/double quotes around a whole value are accepted.
+`env_file` is parsed as simple dotenv-style `KEY=VALUE` data. Blank lines, `#` comments, optional `export`, and simple quotes around a complete value are accepted. It is **not sourced as shell code**.
 
-It is **not sourced as shell code**. This is intentional: project environment data should not be an implicit code-execution hook in a group-wide submission helper.
+For Apptainer jobs these values are passed through `APPTAINERENV_*`, together with `HUMMEL_RUN_NAME`, `HUMMEL_RUN_DIR`, and `HUMMEL_CHAIN_ID`.
 
-For Apptainer jobs these values are passed through `APPTAINERENV_*`, along with the runtime variables `HUMMEL_RUN_NAME`, `HUMMEL_RUN_DIR`, and `HUMMEL_CHAIN_ID`.
+## Frozen worker
 
-## Hummel-specific worker
+Each chain stores its resolved JSON state plus a single ZIP snapshot of the installed Python worker. Later hops import directly from that ZIP. This keeps package upgrades from changing a running chain while avoiding a proliferation of tiny Python files on BeeGFS.
 
-The packaged `worker.sh` deliberately starts with:
+The packaged `worker.sh` starts with:
 
 ```bash
 source /sw/batch/init.sh
 ```
 
-before any other command, as required on Hummel-2. It then executes the frozen Python worker snapshot. No `srun` is used.
-
+before executing the frozen worker. No `srun` is used.
 
 ## Migration from the original shell launcher
-
-The main settings map directly:
 
 | Original shell setting | New TOML setting |
 | --- | --- |
@@ -208,24 +240,22 @@ The main settings map directly:
 
 There is intentionally no `RUN_NAME_CMD` equivalent. Run names are generated without `eval`; use `hummel-submit submit --run-name NAME` when an explicit name is needed.
 
-For the short `gputest` setup described by the old launcher, the equivalent project override is, for example:
+For the short `gputest` setup from the old launcher, for example:
 
 ```toml
 [slurm]
 partition = "gputest"
 time_limit = "00:10:00"
 signal_seconds = 60
-gpus_per_node = 0
+gpus = 0
 extra_args = ["--cpus-per-task=8"]
 ```
 
-The group reservation remains opt-in: leaving `reservation = ""` does not pin a job to `g002`; `extra_args = ["--exclude=g002"]` remains available for long runs that should stay off it.
+The group reservation remains opt-in. Leaving `reservation = ""` does not pin a job to `g002`; `extra_args = ["--exclude=g002"]` remains available for long runs that should stay off it.
 
 ## Development
 
 The project has no runtime dependencies beyond Python >= 3.11.
-
-Run tests with:
 
 ```bash
 python3 -m unittest discover -s tests -v

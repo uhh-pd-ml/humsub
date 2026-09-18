@@ -10,6 +10,7 @@ from typing import Any
 from . import __version__
 from .config import ConfigError, PROJECT_CONFIG_NAME, USER_CONFIG, config_as_json, load_config, validate_run_name
 from .slurm import SlurmError, cancel_jobs, queue_status, sbatch_command, submit
+from .pathcheck import PathCheckError, check_compute_writable, check_payload_args
 from .state import append_job, chain_root, create_state, default_run_name, done_marker, load_state, mark_status
 from .templates import PROJECT_TEMPLATE, USER_TEMPLATE
 
@@ -38,6 +39,7 @@ def _parser() -> argparse.ArgumentParser:
     submit_p.add_argument("--mail")
     submit_p.add_argument("--max-hops", type=int)
     submit_p.add_argument("--sbatch-arg", action="append", default=[], help="append an extra sbatch option; repeat as needed")
+    submit_p.add_argument("--skip-path-checks", action="store_true", help="skip Hummel filesystem/path validation (escape hatch)")
     submit_p.add_argument("args", nargs=argparse.REMAINDER)
 
     status = sub.add_parser("status", help="show saved chain state and current SLURM queue state")
@@ -110,10 +112,41 @@ def _prepare_submission(args: argparse.Namespace, dry_run: bool) -> tuple[dict[s
     if not env_file.exists():
         print(f"[submit] note: no env file at {env_file}", file=sys.stderr)
 
+    if exe["image"] != "none":
+        for bind in exe["binds"]:
+            if not Path(bind).exists():
+                raise ConfigError(f"Apptainer bind path does not exist on the submission node: {bind}")
+
     user_args = list(args.args)
     if user_args and user_args[0] == "--":
         user_args = user_args[1:]
     run_name = validate_run_name(args.run_name) if args.run_name else default_run_name()
+
+    if not args.skip_path_checks:
+        checks = [
+            check_compute_writable(Path(exe["output_dir"]), "execution.output_dir", must_be_shared=True),
+            check_compute_writable(Path(exe["cache_dir"]), "execution.cache_dir"),
+        ]
+        # Inspect both project-supplied auto arguments and one-off user arguments.
+        # Resolve the placeholders known at submit time; leave runtime-only placeholders
+        # untouched so the checker does not mistake them for host paths.
+        run_dir = str(Path(exe["output_dir"]) / "runs" / run_name)
+        auto_args = [
+            token.replace("{RUN}", run_name).replace("{RUN_DIR}", run_dir)
+            for token in exe["auto_args"]
+        ]
+        checks.extend(check_payload_args(
+            auto_args + user_args,
+            project_dir,
+            extra_writable=config["validation"]["writable_args"],
+        ))
+        for check in checks:
+            prefix = "WARNING" if check.status == "warning" else "path ok"
+            stream = sys.stderr if check.status == "warning" else sys.stdout
+            print(f"[submit] {prefix}: {check.label}: {check.resolved} ({check.detail})", file=stream)
+    else:
+        print("[submit] WARNING: filesystem/path validation disabled by --skip-path-checks", file=sys.stderr)
+
     return config, sources, run_name, user_args
 
 
@@ -144,7 +177,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             "user_args": user_args,
             "resubmit": not args.no_resubmit,
             "python_executable": sys.executable,
-            "snapshot_root": str(fake_dir / "snapshot"),
+            "snapshot_path": str(fake_dir / "hummel-submit-worker.zip"),
             "worker_script": str(fake_dir / "worker.sh"),
         }
         cmd = sbatch_command(fake_state, fake_dir / "state.json", 0)
@@ -245,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.subcommand == "cancel":
             return cmd_cancel(args)
         parser.error("unknown command")
-    except (ConfigError, SlurmError, OSError, ValueError) as exc:
+    except (ConfigError, PathCheckError, SlurmError, OSError, ValueError) as exc:
         print(f"hummel-submit: error: {exc}", file=sys.stderr)
         return 2
     return 0

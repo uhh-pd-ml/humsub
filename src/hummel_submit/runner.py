@@ -73,33 +73,34 @@ def build_command(state: dict[str, Any], *, resuming: bool) -> tuple[list[str], 
     return [*exe["command"], *auto, *state["user_args"]], ckpt, ngpu, strategy
 
 
-def _runtime_env(state: dict[str, Any], job_id: str) -> tuple[dict[str, str], dict[str, str]]:
+def _runtime_env(state: dict[str, Any], job_id: str) -> tuple[dict[str, str], dict[str, str], Path]:
     exe = state["config"]["execution"]
     env_file = Path(exe["env_file"])
     loaded = load_env_file(env_file)
     env = os.environ.copy()
     env.update(loaded)
-    cache = f"/tmp/{os.environ.get('USER', 'user')}-cache-{job_id}"
+    cache = Path(exe["cache_dir"]) / job_id
+    cache.mkdir(parents=True, exist_ok=True)
     runtime = {
         "SLURM_JOB_NAME": "interactive",
-        "MPLCONFIGDIR": f"{cache}/mpl",
-        "TRITON_CACHE_DIR": f"{cache}/triton",
-        "TORCHINDUCTOR_CACHE_DIR": f"{cache}/inductor",
+        "MPLCONFIGDIR": str(cache / "mpl"),
+        "TRITON_CACHE_DIR": str(cache / "triton"),
+        "TORCHINDUCTOR_CACHE_DIR": str(cache / "inductor"),
         "PYTHONPATH": state["project_dir"] + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""),
         "HUMMEL_RUN_NAME": state["run_name"],
         "HUMMEL_RUN_DIR": state["run_dir"],
         "HUMMEL_CHAIN_ID": state["chain_id"],
     }
     env.update(runtime)
-    return env, {**loaded, **runtime}
+    return env, {**loaded, **runtime}, cache
 
 
-def make_process_command(state: dict[str, Any], command: list[str], ngpu: int) -> tuple[list[str], dict[str, str]]:
+def make_process_command(state: dict[str, Any], command: list[str], ngpu: int) -> tuple[list[str], dict[str, str], Path]:
     exe = state["config"]["execution"]
     job_id = os.environ.get("SLURM_JOB_ID", "unknown")
-    env, container_env = _runtime_env(state, job_id)
+    env, container_env, cache = _runtime_env(state, job_id)
     if exe["image"] == "none":
-        return command, env
+        return command, env, cache
 
     apptainer = exe.get("apptainer") or shutil.which("apptainer") or "/sw/env/system-gcc/apptainer/1.4.5/bin/apptainer"
     proc_cmd = [apptainer, "exec"]
@@ -111,7 +112,7 @@ def make_process_command(state: dict[str, Any], command: list[str], ngpu: int) -
 
     for key, value in container_env.items():
         env[f"APPTAINERENV_{key}"] = value
-    return proc_cmd, env
+    return proc_cmd, env, cache
 
 
 def run_payload(state: dict[str, Any], state_path: Path, hop: int) -> tuple[int, bool, Path | None]:
@@ -124,7 +125,7 @@ def run_payload(state: dict[str, Any], state_path: Path, hop: int) -> tuple[int,
     log(f"GPUs visible={ngpu}, strategy={strategy}")
     log("running: " + shlex.join(command))
 
-    proc_cmd, env = make_process_command(state, command, ngpu)
+    proc_cmd, env, cache = make_process_command(state, command, ngpu)
     timed_out = False
     child: subprocess.Popen[str] | None = None
 
@@ -151,6 +152,10 @@ def run_payload(state: dict[str, Any], state_path: Path, hop: int) -> tuple[int,
         rc = child.wait()
     finally:
         signal.signal(signal.SIGUSR1, old_handler)
+        try:
+            shutil.rmtree(cache)
+        except OSError as exc:
+            log(f"WARNING: could not remove cache directory {cache}: {exc}")
 
     log(f"payload finished with exit code {rc} (pre-timeout signal received: {timed_out})")
     return rc, timed_out, newest_checkpoint(state)

@@ -14,12 +14,13 @@ USER_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) /
 DEFAULTS: dict[str, Any] = {
     "execution": {
         "image": "none",
-        "output_dir": "/beegfs/u/${USER}/jobs",
+        "output_dir": "${BEEGFS}/jobs",
+        "cache_dir": "${SSD}/.hummel-submit/cache",
         "command": [],
         "auto_args": [],
         "checkpoint_glob": "",
         "env_file": ".env",
-        "binds": ["/beegfs", "/usw", "/nfs/ssd2.0"],
+        "binds": ["${BEEGFS}", "${USW}", "${SSD}"],
         "nv": True,
         "apptainer": "",
     },
@@ -28,7 +29,7 @@ DEFAULTS: dict[str, Any] = {
         "account": "kasieczka_gpu",
         "partition": "gpu",
         "nodes": 1,
-        "gpus_per_node": 1,
+        "gpus": 1,
         "time_limit": "24:00:00",
         "signal_seconds": 600,
         "mail": "",
@@ -37,16 +38,17 @@ DEFAULTS: dict[str, Any] = {
         "retry_on_failure": False,
         "extra_args": [],
     },
+    "validation": {
+        "writable_args": [],
+    },
 }
 
-_ALLOWED = {
-    "execution": set(DEFAULTS["execution"]),
-    "slurm": set(DEFAULTS["slurm"]),
-}
+_ALLOWED = {section: set(values) for section, values in DEFAULTS.items()}
 
 _ENV_OVERRIDES = {
     "HUMMEL_IMAGE": ("execution", "image", str),
     "HUMMEL_OUTPUT_DIR": ("execution", "output_dir", str),
+    "HUMMEL_CACHE_DIR": ("execution", "cache_dir", str),
     "HUMMEL_ACCOUNT": ("slurm", "account", str),
     "HUMMEL_PARTITION": ("slurm", "partition", str),
     "HUMMEL_TIME_LIMIT": ("slurm", "time_limit", str),
@@ -59,7 +61,7 @@ _RESERVED_SBATCH_OPTIONS = {
     "--account", "-A",
     "--partition", "-p",
     "--nodes", "-N",
-    "--gpus-per-node",
+    "--gpus", "--gpus-per-node",
     "--time", "-t",
     "--export",
     "--signal",
@@ -71,7 +73,9 @@ _RESERVED_SBATCH_OPTIONS = {
     "--dependency", "-d",
 }
 
+_FORBIDDEN_MEMORY_OPTIONS = {"--mem", "--mem-per-cpu", "--mem-per-gpu"}
 _RUN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_UNEXPANDED_ENV_RE = re.compile(r"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)")
 
 
 class ConfigError(ValueError):
@@ -104,6 +108,12 @@ def _merge(dst: dict[str, Any], src: dict[str, Any]) -> None:
 
 def _expand_path(value: str, project_dir: Path, *, relative_to_project: bool = True) -> str:
     value = os.path.expanduser(os.path.expandvars(value))
+    unresolved = _UNEXPANDED_ENV_RE.search(value)
+    if unresolved:
+        raise ConfigError(
+            f"path contains unresolved environment variable {unresolved.group(0)!r}; "
+            "run hummel-submit from a Hummel-2 frontend or define the variable explicitly"
+        )
     if not value:
         return value
     path = Path(value)
@@ -143,6 +153,7 @@ def load_config(
 
     exe = config["execution"]
     exe["output_dir"] = _expand_path(str(exe["output_dir"]), project_dir)
+    exe["cache_dir"] = _expand_path(str(exe["cache_dir"]), project_dir)
     if str(exe["image"]).lower() != "none":
         exe["image"] = _expand_path(str(exe["image"]), project_dir)
     else:
@@ -159,6 +170,7 @@ def load_config(
 def validate_config(config: dict[str, Any], *, require_command: bool = True) -> None:
     exe = config["execution"]
     slurm = config["slurm"]
+    validation = config["validation"]
 
     if not isinstance(exe["command"], list) or not all(isinstance(x, str) and x for x in exe["command"]):
         raise ConfigError("[execution].command must be an array of non-empty strings")
@@ -175,13 +187,13 @@ def validate_config(config: dict[str, Any], *, require_command: bool = True) -> 
         if gp.is_absolute() or ".." in gp.parts:
             raise ConfigError("[execution].checkpoint_glob must stay inside the run directory (no absolute path or '..')")
 
-    for key in ("nodes", "gpus_per_node", "signal_seconds", "max_hops"):
+    for key in ("nodes", "gpus", "signal_seconds", "max_hops"):
         if not isinstance(slurm[key], int):
             raise ConfigError(f"[slurm].{key} must be an integer")
     if slurm["nodes"] < 1:
         raise ConfigError("[slurm].nodes must be >= 1")
-    if slurm["gpus_per_node"] < 0:
-        raise ConfigError("[slurm].gpus_per_node must be >= 0")
+    if slurm["gpus"] < 0:
+        raise ConfigError("[slurm].gpus must be >= 0")
     if slurm["signal_seconds"] < 1:
         raise ConfigError("[slurm].signal_seconds must be >= 1")
     if slurm["max_hops"] < 1:
@@ -191,6 +203,10 @@ def validate_config(config: dict[str, Any], *, require_command: bool = True) -> 
         raise ConfigError("[slurm].retry_on_failure must be true or false")
     if not isinstance(slurm["extra_args"], list) or not all(isinstance(x, str) and x for x in slurm["extra_args"]):
         raise ConfigError("[slurm].extra_args must be an array of argument strings")
+    if not isinstance(validation["writable_args"], list) or not all(
+        isinstance(x, str) and x.startswith("-") for x in validation["writable_args"]
+    ):
+        raise ConfigError("[validation].writable_args must be an array of option names such as '--output-dir'")
 
     _validate_extra_args(slurm["extra_args"])
 
@@ -198,6 +214,11 @@ def validate_config(config: dict[str, Any], *, require_command: bool = True) -> 
 def _validate_extra_args(args: list[str]) -> None:
     for arg in args:
         option = arg.split("=", 1)[0]
+        if option in _FORBIDDEN_MEMORY_OPTIONS:
+            raise ConfigError(
+                f"{option} is not allowed on Hummel-2: memory is allocated implicitly with virtual nodes; "
+                "do not pass SLURM memory request options"
+            )
         if option in _RESERVED_SBATCH_OPTIONS:
             raise ConfigError(
                 f"{option} is managed by hummel-submit; set the corresponding [slurm] option instead"

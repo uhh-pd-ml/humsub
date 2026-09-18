@@ -28,7 +28,7 @@ def base_sbatch_args(state: dict[str, Any]) -> list[str]:
         f"--account={slurm['account']}",
         f"--partition={slurm['partition']}",
         f"--nodes={slurm['nodes']}",
-        f"--gpus-per-node={slurm['gpus_per_node']}",
+        f"--gpus={slurm['gpus']}",
         f"--time={slurm['time_limit']}",
         "--export=NONE",
         f"--signal=B:USR1@{slurm['signal_seconds']}",
@@ -50,7 +50,7 @@ def sbatch_command(state: dict[str, Any], state_path: Path, hop: int, dependency
     args += [
         state["worker_script"],
         state["python_executable"],
-        state["snapshot_root"],
+        state["snapshot_path"],
         str(state_path),
         str(hop),
     ]

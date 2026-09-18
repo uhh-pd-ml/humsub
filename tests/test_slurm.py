@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 import unittest
 
 from hummel_submit.slurm import base_sbatch_args
@@ -17,19 +16,20 @@ class SlurmTests(unittest.TestCase):
                     "account": "acct",
                     "partition": "gpu",
                     "nodes": 1,
-                    "gpus_per_node": 1,
+                    "gpus": 1,
                     "time_limit": "04:00:00",
                     "signal_seconds": 600,
                     "mail": "",
                     "reservation": "",
-                    "extra_args": ["--cpus-per-task=8", "--mem=64G", "--exclude=g002"],
+                    "extra_args": ["--cpus-per-task=8", "--exclude=g002"],
                 }
             },
         }
         args = base_sbatch_args(state)
         self.assertIn("--cpus-per-task=8", args)
-        self.assertIn("--mem=64G", args)
         self.assertIn("--exclude=g002", args)
+        self.assertIn("--gpus=1", args)
+        self.assertNotIn("--gpus-per-node=1", args)
         self.assertIn("--export=NONE", args)
 
 

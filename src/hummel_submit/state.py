@@ -5,6 +5,7 @@ import fcntl
 import json
 from pathlib import Path
 import shutil
+import zipfile
 import uuid
 from typing import Any
 
@@ -56,9 +57,11 @@ def create_state(
     chain_id = make_chain_id()
     cdir = chain_dir(output_dir, chain_id)
     cdir.mkdir(parents=True, exist_ok=False)
-    snapshot_root = cdir / "snapshot"
-    snapshot_package = snapshot_root / "hummel_submit"
-    shutil.copytree(package_dir, snapshot_package, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    snapshot_path = cdir / "hummel-submit-worker.zip"
+    with zipfile.ZipFile(snapshot_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for source in sorted(package_dir.rglob("*.py")):
+            relative = source.relative_to(package_dir)
+            archive.write(source, Path("hummel_submit") / relative)
     worker = cdir / "worker.sh"
     shutil.copy2(package_dir / "worker.sh", worker)
 
@@ -79,7 +82,7 @@ def create_state(
         "user_args": user_args,
         "resubmit": resubmit,
         "python_executable": python_executable,
-        "snapshot_root": str(snapshot_root),
+        "snapshot_path": str(snapshot_path),
         "worker_script": str(worker),
         "jobs": [],
         "status": "submitted",
