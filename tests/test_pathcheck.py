@@ -9,9 +9,14 @@ from unittest.mock import patch
 from hummel_submit.pathcheck import PathCheckError, check_compute_writable, check_payload_args
 
 
+def test_tmp_base() -> str:
+    """Use a neutral filesystem root that pathcheck does not classify as Hummel storage."""
+    return os.environ.get("HUMSUB_TEST_TMPDIR", "/var/tmp")
+
+
 class PathCheckTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir=test_tmp_base())
         self.root = Path(self.tmp.name)
         self.home = self.root / "home"
         self.usw = self.root / "usw"

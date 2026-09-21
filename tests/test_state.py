@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,9 +10,14 @@ import hummel_submit
 from hummel_submit.state import create_state
 
 
+def test_tmp_base() -> str:
+    """Use a neutral filesystem root that pathcheck does not classify as Hummel storage."""
+    return os.environ.get("HUMSUB_TEST_TMPDIR", "/var/tmp")
+
+
 class StateTests(unittest.TestCase):
     def test_worker_snapshot_is_single_importable_zip(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=test_tmp_base()) as td:
             root = Path(td)
             output = root / "output"
             project = root / "project"
