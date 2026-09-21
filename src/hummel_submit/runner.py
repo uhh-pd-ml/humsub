@@ -33,6 +33,16 @@ def newest_checkpoint(state: dict[str, Any]) -> Path | None:
 
 def detect_ngpu() -> int:
     raw = os.environ.get("SLURM_GPUS_ON_NODE", "").strip()
+
+    # Inside SLURM, report the resources allocated to the job rather than
+    # probing physical hardware on the node.  CPU-only jobs may run on hosts
+    # where nvidia-smi exists (or can see a device outside the allocation),
+    # which must not turn into a false positive GPU count.
+    if os.environ.get("SLURM_JOB_ID"):
+        if raw.isdigit():
+            return int(raw)
+        return 0
+
     if raw.isdigit() and int(raw) > 0:
         return int(raw)
     nvidia = shutil.which("nvidia-smi")

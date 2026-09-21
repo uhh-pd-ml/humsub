@@ -7,7 +7,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from hummel_submit.runner import newest_checkpoint, render_auto_args
+from hummel_submit.runner import detect_ngpu, newest_checkpoint, render_auto_args
 
 
 class RunnerTests(unittest.TestCase):
@@ -33,6 +33,23 @@ class RunnerTests(unittest.TestCase):
             os.utime(b, (time.time() + 100, time.time() + 100))
             state = {"run_dir": str(run), "config": {"execution": {"checkpoint_glob": "checkpoints/*.ckpt"}}}
             self.assertEqual(newest_checkpoint(state), a)
+
+    def test_detect_ngpu_does_not_probe_hardware_in_cpu_slurm_job(self) -> None:
+        with patch.dict(os.environ, {"SLURM_JOB_ID": "12345"}, clear=False):
+            os.environ.pop("SLURM_GPUS_ON_NODE", None)
+            with patch("hummel_submit.runner.shutil.which") as which:
+                self.assertEqual(detect_ngpu(), 0)
+                which.assert_not_called()
+
+    def test_detect_ngpu_uses_slurm_allocation(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"SLURM_JOB_ID": "12345", "SLURM_GPUS_ON_NODE": "2"},
+            clear=False,
+        ):
+            with patch("hummel_submit.runner.shutil.which") as which:
+                self.assertEqual(detect_ngpu(), 2)
+                which.assert_not_called()
 
 
 if __name__ == "__main__":
