@@ -11,7 +11,7 @@ from hummel_submit.state import create_state
 
 class StateTests(unittest.TestCase):
     def test_worker_snapshot_is_single_importable_zip(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/mnt/data") as td:
+        with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             output = root / "output"
             project = root / "project"

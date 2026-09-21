@@ -11,7 +11,7 @@ from hummel_submit.pathcheck import PathCheckError, check_compute_writable, chec
 
 class PathCheckTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory(dir="/mnt/data")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.home = self.root / "home"
         self.usw = self.root / "usw"
