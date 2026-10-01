@@ -7,7 +7,7 @@ import unittest
 import zipfile
 
 import hummel_submit
-from hummel_submit.state import create_state
+from hummel_submit.state import create_chain_state
 
 
 def test_tmp_base() -> str:
@@ -22,28 +22,33 @@ class StateTests(unittest.TestCase):
             output = root / "output"
             project = root / "project"
             project.mkdir()
+            payload = root / "law-job.sh"
+            payload.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
             package_dir = Path(hummel_submit.__file__).resolve().parent
             config = {
                 "execution": {"checkpoint_glob": ""},
                 "slurm": {},
                 "validation": {},
             }
-            state, state_path = create_state(
+            state, state_path = create_chain_state(
                 output_dir=output,
                 project_dir=project,
                 config=config,
                 run_name="run-test",
-                user_args=[],
                 resubmit=True,
                 python_executable="/usr/bin/python3",
                 package_dir=package_dir,
+                payload_script=payload,
+                submission_id="submission-test",
             )
             snapshot = Path(state["snapshot_path"])
             self.assertTrue(snapshot.is_file())
             self.assertFalse((state_path.parent / "snapshot").exists())
+            self.assertEqual(Path(state["payload_script"]), payload.resolve())
             with zipfile.ZipFile(snapshot) as archive:
                 names = set(archive.namelist())
             self.assertIn("hummel_submit/worker.py", names)
+            self.assertIn("hummel_submit/chain_runner.py", names)
             self.assertIn("hummel_submit/pathcheck.py", names)
 
 

@@ -39,8 +39,9 @@ time_limit = "4:00:00"
 signal_seconds = 600
 max_hops = 20
 
-# Default is deliberately conservative: application failures stop the chain.
-# If true, a failure is retried only when a checkpoint exists.
+# Deprecated compatibility option. In the law-backed architecture, ordinary
+# failures terminate the autonomous chain and are exposed to law as failures;
+# retries belong to law rather than to the Hummel chain itself.
 retry_on_failure = false
 
 # Escape hatch for SLURM options not modeled above, e.g.

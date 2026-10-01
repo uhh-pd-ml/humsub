@@ -1,26 +1,59 @@
 # hummel-submit (`humsub`)
 
-A small, standard-library-only Python helper for submitting restartable jobs on the UHH Hummel-2 cluster.
+`humsub` is a small Hummel-2 frontend and a law backend for restartable Slurm jobs.
 
-It replaces the pattern of copying and editing a large submission shell script. The launcher is installed once; project and personal policy live in layered TOML files.
+Version 0.3 changes the architecture deliberately:
 
-## Design goals
+- **law** owns workflow semantics: tasks, branches, targets, dependencies, merging and normal failure handling.
+- **humsub's Hummel contrib** behaves like a batch system from law's point of view.
+- A remote law job is wrapped in an autonomous **chain** of real Slurm jobs.
+- law only sees the stable chain id; changing inner Slurm job ids never leak into law.
+- Hummel-specific path policy, Slurm options and pre-timeout continuation remain in humsub.
 
-- Keep Hummel-2 rules in one maintained implementation: `--export=NONE`, `/sw/batch/init.sh` first in the batch worker, and no `srun`.
-- Separate personal defaults from project settings.
-- Freeze both the resolved configuration and the worker code for each chain so edits/upgrades cannot change a run halfway through.
-- Replay the same frozen SLURM options on every follower.
-- Continue a chain only after the previous hop explicitly requests continuation on SLURM's pre-timeout `USR1` signal.
-- Scope checkpoint discovery to the unique run directory.
-- Stop on ordinary application failures by default; retrying is explicit.
-- Follow Hummel-2 storage policy and catch common invalid paths before submission.
-- Avoid shell parsing for payload commands and SLURM extra arguments.
+This is the autonomous continuation model. It is intentionally separate from a planned generic law feature where a special remote-job result can ask law itself to resubmit the job.
+
+## Architecture
+
+```text
+humsub frontend
+    |
+    v
+law workflow / remote job rendering
+    |
+    v
+HummelJobManager
+    |  submit() -> stable chain id
+    |  query(chain id)
+    |  cancel(chain id)
+    v
+humsub autonomous chain
+    |
+    +-- Slurm job A
+    |      pre-timeout USR1
+    |      explicit continuation marker
+    |
+    +-- Slurm job B
+    |
+    +-- Slurm job C ...
+```
+
+The law-generated remote-job script is stored persistently on BeeGFS. Each chain hop executes the same script. If a previous law branch already produced its target, law/Luigi naturally considers it complete when the payload is invoked again.
+
+The chain layer does **not** understand law branches, application checkpoints or scientific outputs. It only understands scheduler lifetime. This keeps law as the single source of truth for workflow completion.
+
+## law version
+
+Development currently targets Marcel Rieger's major law rewrite on the public `release_prep` branch, not the legacy 0.1 API. `pyproject.toml` therefore depends directly on:
+
+```text
+git+https://github.com/riga/law.git@release_prep
+```
+
+The law-specific integration is isolated under `hummel_submit.contrib.hummel` so later API changes are confined to a small adapter.
 
 ## Installation
 
-Requires Python 3.11 or newer. Hummel-2 documentation recommends installing downloaded Python software under `$USW`, because `/home` is for user-authored files and `/usw` is specifically intended for reinstallable software.
-
-A lightweight installation is:
+Requires Python 3.11 or newer. On Hummel, install downloaded Python software under `$USW`:
 
 ```bash
 python3 -m venv "$USW/venvs/hummel-submit"
@@ -29,7 +62,7 @@ mkdir -p "$HOME/.local/bin"
 ln -sf "$USW/venvs/hummel-submit/bin/humsub" "$HOME/.local/bin/humsub"
 ```
 
-The Python interpreter used to invoke `humsub` must be visible at the same absolute path on compute nodes. `/usw` is read-only there, which is fine for an interpreter and installed package.
+Installing the package also installs law from `release_prep`. The Python interpreter and the resulting `law` executable must remain visible at the same absolute path on compute nodes. `/usw` being read-only there is fine.
 
 ## First-time setup
 
@@ -54,8 +87,6 @@ humsub config
 
 ## Hummel-2 storage model
 
-The defaults intentionally use Hummel's environment variables rather than spelling out paths. This avoids hard-coding an SSD number or the current directory layout.
-
 ```text
 $HOME       source/config written by the user; backed up; READ-ONLY in batch jobs
 $USW        installed software/containers;          READ-ONLY in batch jobs
@@ -65,7 +96,7 @@ $SSD        small-file/random-I/O scratch/caches;    writable, no backup/redunda
 /dev/shm    per-job RAM filesystem;                  writable, counts as job memory
 ```
 
-Accordingly, the default user config is essentially:
+Default personal settings are therefore essentially:
 
 ```toml
 [execution]
@@ -74,15 +105,24 @@ cache_dir = "${SSD}/.hummel-submit/cache"
 binds = ["${BEEGFS}", "${USW}", "${SSD}"]
 ```
 
-Large run results and checkpoints go to BeeGFS. Matplotlib, Triton and TorchInductor caches use a per-job directory under `cache_dir`; this directory is removed when the payload exits. The helper does **not** put those caches in `/tmp`, because Hummel-2 implements `/tmp` and `/dev/shm` as RAM-backed job-private filesystems.
+A submission creates two kinds of persistent state below `output_dir`:
 
-The project itself may live under `$HOME`; it only needs to be read there. A batch payload should write results to `{RUN_DIR}` or another writable `$BEEGFS`/`$SSD` location rather than creating files next to the source checkout.
+```text
+.hummel-submit/
+  submissions/<submission-id>/
+    submission.json
+    law/
+      bootstrap.sh
+      control/
+      job-files/
 
-Relevant RRZ documentation:
+  chains/<chain-id>/
+    state.json
+    worker.sh
+    hummel-submit-worker.zip
+```
 
-- https://www.rrz.uni-hamburg.de/en/services/hpc/hummel2-2024/data.html
-- https://www.rrz.uni-hamburg.de/en/services/hpc/hummel2-2024/data/tmpdir.html
-- https://www.rrz.uni-hamburg.de/en/services/hpc/hummel2-2024/batch.html
+The persistent law job-file directory is important: an autonomous successor can run long after the submission-side law process and its temporary directories have disappeared.
 
 ## Example project config
 
@@ -109,50 +149,28 @@ max_hops = 20
 extra_args = ["--cpus-per-task=8"]
 
 [validation]
-# Add application-specific options whose values are known to be write targets.
-# Common names such as --output, --output-dir, --save-dir, --log-file, etc.
-# are recognized automatically.
 writable_args = ["--tensorboard-dir"]
 ```
 
-Hummel-2 determines GPU virtual-node allocation with `--gpus`; the helper therefore emits that form. Explicit SLURM memory requests such as `--mem`, `--mem-per-cpu` and `--mem-per-gpu` are rejected because Hummel-2 policy says memory must not be requested directly.
+`checkpoint_glob` remains an application-level convenience used by the built-in single-payload law workflow. The generic Hummel chain backend itself is checkpoint-agnostic.
 
-`checkpoint_glob` is relative to `$OUTPUT_DIR/runs/<run-name>/`; absolute paths and `..` are rejected so one run cannot accidentally resume another run's checkpoint.
-
-Available `auto_args` placeholders are `{RUN}`, `{RUN_DIR}`, `{NGPU}`, `{STRATEGY}`, and `{CKPT}`. Prefer `--key=value` in `auto_args`: a user-supplied argument with the same `--key` after `--` suppresses the automatic one.
+`slurm.retry_on_failure` is retained for config compatibility but is deprecated in the law-backed architecture. Ordinary application/law failures terminate the autonomous chain and are exposed as failures to law. Failure retries belong at the law workflow level, not inside the chain.
 
 ## Submission-time path validation
 
-Before calling `sbatch`, `humsub` validates paths that it knows must be writable and performs a conservative scan of path-like payload arguments.
+Before invoking law, `humsub` validates paths that it knows must be writable and performs a conservative scan of path-like payload arguments.
 
 It always checks `execution.output_dir` and `execution.cache_dir`. `/home` and `/usw` are hard errors for write targets because both are read-only in Hummel batch jobs. The persistent output directory must also be shared across hops, so `/tmp`, `/dev/shm`, Hummel-managed temporary BeeGFS directories and node-specific NVMe-oF storage are rejected for `output_dir`.
 
-For application arguments, the helper cannot generally know whether a path is an input or output. The policy is therefore deliberately conservative:
+For application arguments:
 
 - an existing path is treated as an input unless its option name is clearly output-like;
 - a nonexistent path is treated as something the job is likely to create and is checked for compute-node writability;
-- common output names such as `--output`, `--output-dir`, `--save-dir`, `--checkpoint-path`, `--log-file`, `--cache-dir`, and variants with `_` are recognized automatically;
-- additional project-specific write options can be declared in `[validation].writable_args`;
-- existing symlink prefixes are resolved before classifying the filesystem;
-- an unrecognized filesystem produces a warning when the submission-node permissions look plausible, because the helper cannot prove its compute-node visibility.
+- common output names such as `--output`, `--output-dir`, `--save-dir`, `--checkpoint-path`, `--log-file` and `--cache-dir` are recognized;
+- additional write options can be declared in `[validation].writable_args`;
+- existing symlink prefixes are resolved before filesystem classification.
 
-Example:
-
-```bash
-# rejected: /home is writable on the frontend but read-only in the batch job
-humsub -- --output-dir="$HOME/results"
-
-# accepted: existing input under /home is read-only but readable
-humsub -- --input="$HOME/config/model.yaml" --output-dir="$BEEGFS/jobs/result"
-```
-
-The check is intentionally not a security boundary and cannot understand arbitrary application semantics or every container-internal path. For an exceptional setup, bypass only the preflight check with:
-
-```bash
-humsub --skip-path-checks -- --some-special-path=/custom/location
-```
-
-`--dry-run` still performs path validation, making it useful as a preflight command.
+Use `--skip-path-checks` only as an explicit escape hatch.
 
 ## Submitting
 
@@ -160,103 +178,105 @@ humsub --skip-path-checks -- --some-special-path=/custom/location
 humsub submit -- --epochs=100 --learning-rate=1e-3
 ```
 
-For convenience, `submit` is the implicit default:
+`submit` remains the implicit default:
 
 ```bash
 humsub --dry-run -- --epochs=100
 humsub --no-resubmit -- --smoke-test
 ```
 
-Useful one-off overrides include:
+The frontend now does the following:
+
+1. resolves and validates the humsub configuration;
+2. freezes a submission specification;
+3. instantiates the built-in one-branch law workflow;
+4. asks law to render and submit the remote job;
+5. `HummelJobManager` wraps that rendered job in an autonomous chain;
+6. law stores the **chain id** as its remote job id.
+
+The CLI uses law with `no_poll=True` to retain the original non-blocking `humsub submit` behavior. More sophisticated projects can import `HummelWorkflow` and let law poll/control workflows normally.
+
+One-off Slurm overrides are unchanged:
 
 ```bash
 humsub submit --time 12:00:00 -- --epochs=100
 humsub submit --reservation kasieczka -- --epochs=2
 humsub submit --sbatch-arg=--exclude=g002 -- --epochs=100
-humsub submit --no-resubmit -- --smoke-test
 ```
 
-Account, partition, time, reservation and GPU count belong in TOML. `slurm.extra_args` / `--sbatch-arg` remain an escape hatch for options such as `--cpus-per-task`, `--constraint`, and `--exclude`. Options that would break chain invariants (`--export`, `--dependency`, `--signal`, etc.) are rejected there.
+Hummel-specific invariants remain enforced: `--export=NONE`, `/sw/batch/init.sh` first in the chain worker, no `srun`, no explicit memory request, and no user-supplied dependency/signal options that would break continuation semantics.
 
-### Courtesy slicing and failures
+## Autonomous continuation
 
-For long training on shared GPUs, use e.g. `time_limit = "4:00:00"` or `"12:00:00"`. Each hop pre-queues an `afterany` follower, but that follower starts useful work only if the preceding hop wrote a continuation marker after receiving the pre-timeout `USR1` signal. A plain `scancel`, startup failure, or ordinary application failure therefore does not silently restart the workload.
+Each hop pre-queues one `afterany` follower. That follower starts useful work only when the preceding hop wrote an explicit continuation marker after receiving Slurm's pre-timeout `USR1` signal.
 
-By default a nonzero application exit stops the chain and cancels its waiting follower. Projects that explicitly want retry behavior can set:
+A normal sequence is:
 
-```toml
-[slurm]
-retry_on_failure = true
+```text
+Slurm A: run law payload
+         receive USR1
+         mark continuation
+         terminate payload process group
+         exit successfully
+
+Slurm B: verify marker
+         execute the same law payload again
 ```
 
-A failed hop then continues only if a checkpoint exists.
+From law's point of view the job is still the same stable chain id and remains running. The inner Slurm ids are implementation details recorded in the chain state.
 
-## Cancelling and inspecting a chain
+A plain application failure does **not** continue. The waiting follower is cancelled, the chain becomes failed, and `HummelJobManager.query(chain_id)` reports a law failure.
 
-Submission prints a chain id. Inspect or cancel it with:
+## Status and cancellation
+
+Submission prints the stable chain id:
 
 ```bash
-humsub status 20260918-140501-a1b2c3d4
-humsub cancel 20260918-140501-a1b2c3d4
+humsub status 20261001-140501-a1b2c3d4
+humsub cancel 20261001-140501-a1b2c3d4
 ```
 
-A SLURM job id belonging to the chain can also be supplied. A plain `scancel <current-job>` is safe: the waiting follower wakes without a continuation marker, marks the chain stopped, and exits without launching the payload.
+A known inner Slurm job id can still be supplied to the CLI for convenience; humsub resolves it back to its chain.
 
-## Environment file
+`HummelJobManager.cancel(chain_id)` cancels all known inner Slurm jobs and marks the chain terminal. law therefore never needs to know which inner job is currently active.
 
-`env_file` is parsed as simple dotenv-style `KEY=VALUE` data. Blank lines, `#` comments, optional `export`, and simple quotes around a complete value are accepted. It is **not sourced as shell code**.
+## Using the Hummel contrib from custom law workflows
 
-For Apptainer jobs these values are passed through `APPTAINERENV_*`, together with `HUMMEL_RUN_NAME`, `HUMMEL_RUN_DIR`, and `HUMMEL_CHAIN_ID`.
+The generic command-line workflow is intentionally small. Framework integrations should define normal law tasks and inherit the Hummel workflow backend directly:
 
-## Frozen worker
+```python
+import law
 
-Each chain stores its resolved JSON state plus a single ZIP snapshot of the installed Python worker. Later hops import directly from that ZIP. This keeps package upgrades from changing a running chain while avoiding a proliferation of tiny Python files on BeeGFS.
+from hummel_submit.contrib.hummel import HummelWorkflow
 
-The packaged `worker.sh` starts with:
+
+class MyTask(law.Task, HummelWorkflow, law.LocalWorkflow):
+    # humsub_spec is supplied by the frontend/framework integration
+
+    def create_branch_map(self):
+        return {...}
+
+    def output(self):
+        ...
+
+    def run(self):
+        ...
+```
+
+This is the intended extension point for future DAS and ML/HPO drivers. Splitting, dependencies and merging belong in law tasks; Hummel-specific scheduling and autonomous continuation stay in the contrib.
+
+## Frozen chain worker
+
+Each chain still stores a ZIP snapshot of the installed humsub Python worker plus `worker.sh`. Package upgrades therefore cannot alter continuation mechanics halfway through an existing chain.
+
+The law remote-job script and its rendered inputs are stored separately in the submission's persistent law job-file directory. The chain executes this immutable rendered payload on every hop.
+
+## Testing
+
+The scheduler-independent unit tests can be run with:
 
 ```bash
-source /sw/batch/init.sh
+PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-before executing the frozen worker. No `srun` is used.
-
-## Migration from the original shell launcher
-
-| Original shell setting | New TOML setting |
-| --- | --- |
-| `IMAGE` | `execution.image` |
-| `OUTPUT_DIR` | `execution.output_dir` |
-| `COMMAND=(...)` | `execution.command = [...]` |
-| `AUTO_ARGS=(...)` | `execution.auto_args = [...]` |
-| `CKPT_GLOB` | `execution.checkpoint_glob` |
-| `ENV_FILE` | `execution.env_file` |
-| `BINDS` | `execution.binds` |
-| `ACCOUNT` | `slurm.account` |
-| `MAIL` | `slurm.mail` |
-| `RESERVATION` | `slurm.reservation` |
-| `TIME_LIMIT` | `slurm.time_limit` |
-| `MAX_HOPS` | `slurm.max_hops` |
-| `SBATCH_ARGS` | `slurm.extra_args` |
-
-There is intentionally no `RUN_NAME_CMD` equivalent. Run names are generated without `eval`; use `humsub submit --run-name NAME` when an explicit name is needed.
-
-For the short `gputest` setup from the old launcher, for example:
-
-```toml
-[slurm]
-partition = "gputest"
-time_limit = "00:10:00"
-signal_seconds = 60
-gpus = 0
-extra_args = ["--cpus-per-task=8"]
-```
-
-The group reservation remains opt-in. Leaving `reservation = ""` does not pin a job to `g002`; `extra_args = ["--exclude=g002"]` remains available for long runs that should stay off it.
-
-## Development
-
-The project has no runtime dependencies beyond Python >= 3.11.
-
-```bash
-python3 -m unittest discover -s tests -v
-```
+A full integration test additionally requires the `release_prep` law dependency and a Slurm/Hummel environment.
