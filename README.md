@@ -321,6 +321,23 @@ humsub submit-manifest \
   --run-name example-001
 ```
 
+Large directory stages can be filtered at freeze time with repeatable
+`--stage-exclude NAME=PATTERN` options.  This keeps generated build trees,
+caches, and previous outputs out of immutable submission snapshots without
+putting application-specific copy logic into the payload:
+
+```bash
+humsub submit-manifest \
+  --manifest branches.json \
+  --payload ./run-branch.py \
+  --stage source=/home/user/my-source \
+  --stage-exclude 'source=build' \
+  --stage-exclude 'source=*.root' \
+  --run-name example-001
+```
+
+When `rsync` is available, patterns use its `--exclude` matching semantics.
+
 The payload is invoked as:
 
 ```text

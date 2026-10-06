@@ -15,7 +15,7 @@ from .slurm import SlurmError, queue_status, sbatch_command
 from .state import chain_root, default_run_name, load_state
 from .submission import create_submission_spec, load_submission_spec, submission_root
 from .manifest import freeze_manifest_workflow, load_manifest
-from .staging import parse_stage_spec, stage_inputs
+from .staging import parse_stage_exclude, parse_stage_spec, stage_inputs
 from .templates import PROJECT_TEMPLATE, USER_TEMPLATE
 
 
@@ -55,6 +55,10 @@ def _parser() -> argparse.ArgumentParser:
     manifest.add_argument(
         "--stage", action="append", default=[], metavar="NAME=PATH",
         help="freeze a file or directory for all branches; repeat as needed",
+    )
+    manifest.add_argument(
+        "--stage-exclude", action="append", default=[], metavar="NAME=PATTERN",
+        help="exclude a pattern while freezing a directory stage; repeat as needed",
     )
     manifest.add_argument("--run-name")
     manifest.add_argument("--wait", action="store_true", help="keep law alive to poll and retry remote jobs")
@@ -314,6 +318,16 @@ def _stage_map(values: list[str]) -> dict[str, Path]:
     return result
 
 
+def _stage_exclude_map(values: list[str], stages: dict[str, Path]) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    for value in values:
+        name, pattern = parse_stage_exclude(value)
+        if name not in stages:
+            raise ConfigError(f"stage exclude references unknown stage {name!r}")
+        result.setdefault(name, []).append(pattern)
+    return result
+
+
 def _print_manifest_submission(spec: dict[str, Any], output_dir: Path, *, wait: bool) -> None:
     print(f"[submit] submission  {spec['submission_id']}")
     print(f"[submit] run         {spec['run_name']}")
@@ -343,6 +357,7 @@ def cmd_submit_manifest(args: argparse.Namespace) -> int:
         raise ConfigError(f"payload does not exist: {payload_source}")
     manifest = load_manifest(manifest_source)
     stages = _stage_map(args.stage)
+    stage_excludes = _stage_exclude_map(args.stage_exclude, stages)
 
     if args.retries < 0 or args.tasks_per_job < 1 or args.parallel_jobs < 0:
         raise ConfigError("retries and parallel_jobs must be >= 0 and tasks_per_job must be >= 1")
@@ -370,6 +385,8 @@ def cmd_submit_manifest(args: argparse.Namespace) -> int:
     print(f"[submit] output      {output_dir}")
     for name, path in stages.items():
         print(f"[submit] stage       {name}={path}")
+        for pattern in stage_excludes.get(name, []):
+            print(f"[submit] exclude     {name}={pattern}")
     if sources:
         print(f"[submit] config      {', '.join(map(str, sources))}")
 
@@ -391,7 +408,12 @@ def cmd_submit_manifest(args: argparse.Namespace) -> int:
             python_executable=sys.executable,
         )
         staged_root = cache_dir / "stages" / spec["submission_id"]
-        frozen_stages = stage_inputs(stages, cache_dir=cache_dir, submission_id=spec["submission_id"])
+        frozen_stages = stage_inputs(
+            stages,
+            cache_dir=cache_dir,
+            submission_id=spec["submission_id"],
+            excludes=stage_excludes,
+        )
         spec = freeze_manifest_workflow(
             spec_path,
             manifest_source=manifest_source,
