@@ -11,7 +11,7 @@ from . import __version__
 from .chain import cancel_chain, query_chain
 from .config import ConfigError, PROJECT_CONFIG_NAME, USER_CONFIG, config_as_json, load_config, validate_run_name
 from .pathcheck import PathCheckError, check_compute_writable, check_payload_args
-from .slurm import SlurmError, queue_status, sbatch_command
+from .slurm import SlurmError, queue_status, sbatch_command, slurm_log_path
 from .state import chain_root, default_run_name, load_state
 from .submission import create_submission_spec, load_submission_spec, submission_root
 from .manifest import freeze_manifest_workflow, load_manifest
@@ -515,6 +515,24 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(queued)
     else:
         print("SLURM:   no known jobs currently in squeue")
+
+    jobs = list(map(str, state.get("jobs", [])))
+    if jobs:
+        current = str(state.get("current_job_id", ""))
+        next_job = str(state.get("next_job_id", ""))
+        print("logs:")
+        for job_id in jobs:
+            log_path = slurm_log_path(state, job_id)
+            if job_id == current:
+                role = "current"
+            elif job_id == next_job:
+                role = "next"
+            else:
+                role = "previous"
+            availability = "exists" if log_path.exists() else "not created yet"
+            print(f"  {job_id} {role:<8} {log_path} ({availability})")
+    else:
+        print("logs:    no known Slurm job logs yet")
     return 0
 
 

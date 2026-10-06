@@ -238,6 +238,8 @@ humsub cancel 20261001-140501-a1b2c3d4
 
 A known inner Slurm job id can still be supplied to the CLI for convenience; humsub resolves it back to its chain.
 
+`humsub status` also lists the deterministic Slurm log path for every known hop, marking the current and queued successor jobs and whether each log file already exists.  This makes it straightforward to follow the active log with `tail -f` without searching the output directory manually.
+
 `HummelJobManager.cancel(chain_id)` cancels all known inner Slurm jobs and marks the chain terminal. law therefore never needs to know which inner job is currently active.
 
 ## Using the Hummel contrib from custom law workflows

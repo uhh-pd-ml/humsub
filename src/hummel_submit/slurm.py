@@ -42,10 +42,26 @@ def slurm_command(name: str) -> str:
     return str(fallback)
 
 
+def slurm_log_path(state: dict[str, Any], job_id: str | None = None) -> Path:
+    """Return the Slurm stdout/stderr path for a chain job.
+
+    With *job_id* omitted, the returned path contains Slurm's ``%x`` and ``%j``
+    replacement tokens and is suitable for ``sbatch --output``.  With a job id,
+    return the concrete path that Slurm writes for that job.
+    """
+    output_dir = Path(state["output_dir"])
+    if job_id is None:
+        name = "%x"
+        jid = "%j"
+    else:
+        name = str(state["config"]["slurm"]["job_name"])
+        jid = str(job_id)
+    return output_dir / "logs" / f"{name}_{jid}.log"
+
+
 def base_sbatch_args(state: dict[str, Any]) -> list[str]:
     cfg = state["config"]
     slurm = cfg["slurm"]
-    output_dir = Path(state["output_dir"])
     args = [
         "--parsable",
         f"--job-name={slurm['job_name']}",
@@ -55,7 +71,7 @@ def base_sbatch_args(state: dict[str, Any]) -> list[str]:
         f"--time={slurm['time_limit']}",
         "--export=NONE",
         f"--chdir={state['project_dir']}",
-        f"--output={output_dir / 'logs' / '%x_%j.log'}",
+        f"--output={slurm_log_path(state)}",
     ]
     if slurm["gpus"] > 0:
         args.append(f"--gpus={slurm['gpus']}")
