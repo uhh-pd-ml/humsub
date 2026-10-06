@@ -85,6 +85,13 @@ class HummelWorkflow(SlurmWorkflow):
         slurm = spec["config"]["slurm"]
         config.job_name = f"{slurm['job_name']}-law-{job_num}"
         config.partition = slurm["partition"]
+
+        # Render the exact submission-side host executables into law_job.sh.
+        # In particular, do not resolve a virtualenv Python symlink into /sw/env:
+        # the law console script lives in the virtualenv bin directory itself.
+        config.render_variables["python_exe"] = spec["python_executable"]
+        if spec.get("law_executable"):
+            config.render_variables["law_exe"] = spec["law_executable"]
         return config
 
     def slurm_check_job_completeness(self) -> bool:

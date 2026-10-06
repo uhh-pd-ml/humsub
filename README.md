@@ -250,7 +250,7 @@ import law
 from hummel_submit.contrib.hummel import HummelWorkflow
 
 
-class MyTask(law.Task, HummelWorkflow, law.LocalWorkflow):
+class MyTask(HummelWorkflow, law.LocalWorkflow):
     # humsub_spec is supplied by the frontend/framework integration
 
     def create_branch_map(self):
@@ -263,7 +263,7 @@ class MyTask(law.Task, HummelWorkflow, law.LocalWorkflow):
         ...
 ```
 
-This is the intended extension point for future DAS and ML/HPO drivers. Splitting, dependencies and merging belong in law tasks; Hummel-specific scheduling and autonomous continuation stay in the contrib.
+This remains the extension point for workflows that need custom law task classes.  Independent branch/payload applications should prefer `humsub submit-manifest`. Splitting, dependencies and merging belong in law tasks; Hummel-specific scheduling and autonomous continuation stay in the contrib.
 
 ## Frozen chain worker
 
@@ -280,3 +280,88 @@ PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 A full integration test additionally requires the `release_prep` law dependency and a Slurm/Hummel environment.
+
+## Generic manifest payload workflows
+
+Version 0.4 adds a generic application boundary for workflows whose work can be
+expressed as independent branches.  The application provides:
+
+1. a JSON manifest describing branch data and declared outputs;
+2. one executable payload that knows how to run a single branch; and
+3. optional named files/directories that humsub freezes into submission-owned
+   staging paths.
+
+humsub owns law/Luigi integration, Hummel submission, autonomous continuation,
+host virtualenv restoration, immutable payload/manifest copies, branch scratch,
+and output-completeness checks.
+
+Example manifest:
+
+```json
+{
+  "schema": 1,
+  "common": {"application": "example"},
+  "branches": [
+    {
+      "id": 0,
+      "data": {"input": "/some/input"},
+      "outputs": ["/beegfs/user/jobs/example/output-0.dat"]
+    }
+  ]
+}
+```
+
+Submit it with:
+
+```bash
+humsub submit-manifest \
+  --manifest branches.json \
+  --payload ./run-branch.py \
+  --stage source=/home/user/my-source \
+  --run-name example-001
+```
+
+The payload is invoked as:
+
+```text
+/path/to/frozen/payload /path/to/frozen/branch-context.json
+```
+
+The context combines top-level `common`, branch-specific `data`, `outputs`, and
+submission-specific `stages`.  In addition, humsub exports:
+
+```text
+HUMSUB_SUBMISSION_ID
+HUMSUB_RUN_NAME
+HUMSUB_RUN_DIR
+HUMSUB_BRANCH
+HUMSUB_BRANCH_FILE
+HUMSUB_SCRATCH
+HUMSUB_ATTEMPT
+HUMSUB_STAGE_<NAME>
+```
+
+For example, `--stage das=/path/to/source` becomes `HUMSUB_STAGE_DAS`.
+Applications should write outputs atomically (e.g. into `HUMSUB_SCRATCH` first,
+then rename/move them to the declared output paths).  On payload failure humsub
+removes declared file targets so a partial output cannot make law consider a
+retry complete.
+
+`--wait` keeps law alive for controller-side retries and bounded rolling
+submission.  Without `--wait`, use `--parallel-jobs=0` (the default) when all
+branches should be submitted immediately.  Failure retries require `--wait`.
+
+A complete submission can be summarized with:
+
+```bash
+humsub submission-status <submission-id>
+```
+
+### Host runtime boundary
+
+law itself always runs in the Hummel host environment.  The exact submission
+Python and law executable paths are frozen into `submission.json` and rendered
+into law's remote script without resolving virtualenv symlinks.  Application
+containers belong inside the application payload, not around the law remote
+job.  This avoids host/container glibc mismatches and keeps the scheduler layer
+independent of application runtime choices such as Apptainer or `cmsexec`.
