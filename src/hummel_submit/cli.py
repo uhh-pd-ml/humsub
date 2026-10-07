@@ -84,7 +84,7 @@ def _parser() -> argparse.ArgumentParser:
     manifest.add_argument("--sbatch-arg", action="append", default=[])
     manifest.add_argument("--skip-path-checks", action="store_true")
 
-    help_p = sub.add_parser("help", help="show this help message")
+    sub.add_parser("help", help="show this help message")
 
     status = sub.add_parser("status", help="show saved chain state and current SLURM queue state")
     status.add_argument("chain")
@@ -277,15 +277,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
     print(f"[submit] account     {config['slurm']['account']}")
     print(f"[submit] reservation {config['slurm']['reservation'] or 'none (may still be pulled in magnetically)'}")
     print(f"[submit] time limit  {config['slurm']['time_limit']} per hop")
-    print(f"[submit] middleware  law release_prep / Hummel chain backend")
+    print("[submit] middleware  law release_prep / Hummel chain backend")
     print(f"[submit] config      {', '.join(map(str, sources)) if sources else 'built-in defaults only'}")
-
-    if config["slurm"].get("retry_on_failure"):
-        print(
-            "[submit] WARNING: slurm.retry_on_failure is deprecated in the law-backed design; "
-            "ordinary failures terminate a chain and should be retried by law",
-            file=sys.stderr,
-        )
 
     if args.dry_run:
         fake_state, fake_state_path = _fake_chain_state(

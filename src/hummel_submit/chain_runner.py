@@ -50,7 +50,7 @@ def run_chain_payload(
     child: subprocess.Popen[str] | None = None
 
     def on_usr1(signum: int, frame: object) -> None:
-        nonlocal timed_out, child
+        nonlocal timed_out
         timed_out = True
         (state_path.parent / f"continue-{hop}").touch()
         log("time limit approaching: marked chain for continuation and sending SIGTERM to the law payload")

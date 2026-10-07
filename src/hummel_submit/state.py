@@ -123,7 +123,6 @@ def append_job(path: Path, job_id: str) -> dict[str, Any]:
     def update(data: dict[str, Any]) -> None:
         if job_id not in data["jobs"]:
             data["jobs"].append(job_id)
-        data["last_job_id"] = job_id
         if data.get("status") == "submitted":
             data["status"] = "queued"
     return _locked_update(path, update)

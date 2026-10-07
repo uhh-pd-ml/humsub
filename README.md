@@ -154,8 +154,6 @@ writable_args = ["--tensorboard-dir"]
 
 `checkpoint_glob` remains an application-level convenience used by the built-in single-payload law workflow. The generic Hummel chain backend itself is checkpoint-agnostic.
 
-`slurm.retry_on_failure` is retained for config compatibility but is deprecated in the law-backed architecture. Ordinary application/law failures terminate the autonomous chain and are exposed as failures to law. Failure retries belong at the law workflow level, not inside the chain.
-
 ## Submission-time path validation
 
 Before invoking law, `humsub` validates paths that it knows must be writable and performs a conservative scan of path-like payload arguments.

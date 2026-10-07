@@ -30,8 +30,6 @@ class HummelWorkflow(SlurmWorkflow):
     # HummelJobManager handles actual queue interaction.  Keep all law-generated
     # job files persistent because autonomous successor jobs may need them long
     # after the submission-side law process has exited.
-    slurm_job_file_factory_defaults = {"cleanup": False}
-
     _humsub_spec_cache: dict[str, Any] | None = None
 
     def humsub_submission_spec(self) -> dict[str, Any]:
@@ -69,8 +67,7 @@ class HummelWorkflow(SlurmWorkflow):
         job_root = Path(spec["law_dir"]) / "job-files"
         job_root.mkdir(parents=True, exist_ok=True)
 
-        factory_kwargs = dict(self.slurm_job_file_factory_defaults or {})
-        factory_kwargs.update(kwargs)
+        factory_kwargs = dict(kwargs)
         factory_kwargs.setdefault("dir", str(job_root))
         factory_kwargs.setdefault("mkdtemp", True)
         factory_kwargs["cleanup"] = False

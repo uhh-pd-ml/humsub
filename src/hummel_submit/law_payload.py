@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from law.target.local import LocalFileTarget
-from law.task.base import Task as LawTask
 from law.workflow.local import LocalWorkflow
 
 from .contrib.hummel import HummelWorkflow
@@ -11,14 +10,7 @@ from .runner import run_application
 from .submission import load_submission_spec
 
 
-class PayloadTask(LawTask):
-    """Base task for the generic humsub command-line payload workflow."""
-
-    def run(self):
-        raise NotImplementedError
-
-
-class PayloadWorkflow(PayloadTask, HummelWorkflow, LocalWorkflow):
+class PayloadWorkflow(HummelWorkflow, LocalWorkflow):
     """Single-branch law workflow used by the backwards-compatible humsub CLI.
 
     More specialized applications should define their own law workflows and

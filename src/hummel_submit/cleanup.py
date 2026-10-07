@@ -8,7 +8,7 @@ import shutil
 from typing import Iterable
 
 from .chain import query_chain
-from .state import chain_root, load_state
+from .state import chain_root
 from .submission import load_submission_spec, submission_root
 
 
@@ -122,11 +122,7 @@ def cleanup_submission_cache(spec_path: Path, *, force: bool = False, dry_run: b
             f"submission {status.submission_id} is still active; refusing to remove runtime caches (use --force to override)"
         )
     if not dry_run:
-        for entry in status.cache_paths:
-            if entry.path.is_dir() and not entry.path.is_symlink():
-                shutil.rmtree(entry.path, ignore_errors=False)
-            else:
-                entry.path.unlink(missing_ok=True)
+        remove_cache_paths(status.cache_paths)
     return status
 
 

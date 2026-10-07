@@ -6,16 +6,10 @@ from pathlib import Path
 import shutil
 import shlex
 import subprocess
-import time
 from typing import Any
 
+from .chain_runner import log
 from .envfile import load_env_file
-
-
-def log(message: str) -> None:
-    job = os.environ.get("SLURM_JOB_ID", "worker")
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{stamp}] [job:{job}] {message}", flush=True)
 
 
 def newest_checkpoint(state: dict[str, Any]) -> Path | None:

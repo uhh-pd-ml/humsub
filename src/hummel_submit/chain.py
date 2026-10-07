@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
-from typing import Any
 
 from .slurm import cancel_jobs, query_jobs, submit
 from .state import create_chain_state, done_marker, load_state, mark_status, state_path

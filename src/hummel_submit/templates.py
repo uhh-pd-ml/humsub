@@ -39,11 +39,6 @@ time_limit = "4:00:00"
 signal_seconds = 600
 max_hops = 20
 
-# Deprecated compatibility option. In the law-backed architecture, ordinary
-# failures terminate the autonomous chain and are exposed to law as failures;
-# retries belong to law rather than to the Hummel chain itself.
-retry_on_failure = false
-
 # Escape hatch for SLURM options not modeled above, e.g.
 # extra_args = ["--cpus-per-task=8", "--exclude=g002"]
 # Hummel-2 forbids explicit memory requests such as --mem.

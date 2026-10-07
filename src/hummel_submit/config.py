@@ -35,7 +35,6 @@ DEFAULTS: dict[str, Any] = {
         "mail": "",
         "reservation": "",
         "max_hops": 20,
-        "retry_on_failure": False,
         "extra_args": [],
     },
     "validation": {
@@ -199,8 +198,6 @@ def validate_config(config: dict[str, Any], *, require_command: bool = True) -> 
     if slurm["max_hops"] < 1:
         raise ConfigError("[slurm].max_hops must be >= 1")
 
-    if not isinstance(slurm["retry_on_failure"], bool):
-        raise ConfigError("[slurm].retry_on_failure must be true or false")
     if not isinstance(slurm["extra_args"], list) or not all(isinstance(x, str) and x for x in slurm["extra_args"]):
         raise ConfigError("[slurm].extra_args must be an array of argument strings")
     if not isinstance(validation["writable_args"], list) or not all(
