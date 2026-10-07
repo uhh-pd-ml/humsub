@@ -238,7 +238,7 @@ humsub cancel 20261001-140501-a1b2c3d4
 
 A known inner Slurm job id can still be supplied to the CLI for convenience; humsub resolves it back to its chain.
 
-`humsub status` also lists the deterministic Slurm log path for every known hop, marking the current and queued successor jobs and whether each log file already exists.  This makes it straightforward to follow the active log with `tail -f` without searching the output directory manually.
+`humsub status` also lists the deterministic Slurm log path for every known hop, marking the current and queued successor jobs and whether each log file already exists.  For interactive monitoring, `humsub follow CHAIN_ID` behaves like `tail -f` on the active log and automatically switches to the successor log when an autonomous continuation hop takes over.  The first log starts with its last 10 lines (configurable with `-n`); successor logs are read from the beginning so startup output is not missed.
 
 `HummelJobManager.cancel(chain_id)` cancels all known inner Slurm jobs and marks the chain terminal. law therefore never needs to know which inner job is currently active.
 
@@ -399,3 +399,8 @@ humsub gc --apply
 ```
 
 Optional orphan cleanup is explicit, for example `humsub gc --orphans-after-hours 48 --apply`.  This can remove cache directories whose submission metadata no longer exists under the current configured output directory.
+
+
+## CLI help
+
+`humsub help` is an alias for the top-level `humsub -h` help output.

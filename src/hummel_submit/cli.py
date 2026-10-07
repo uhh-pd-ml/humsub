@@ -9,6 +9,7 @@ from typing import Any
 
 from . import __version__
 from .chain import cancel_chain, query_chain
+from .follow import follow_chain
 from .cleanup import (
     cleanup_submission_cache,
     inspect_submission_cache,
@@ -83,8 +84,15 @@ def _parser() -> argparse.ArgumentParser:
     manifest.add_argument("--sbatch-arg", action="append", default=[])
     manifest.add_argument("--skip-path-checks", action="store_true")
 
+    help_p = sub.add_parser("help", help="show this help message")
+
     status = sub.add_parser("status", help="show saved chain state and current SLURM queue state")
     status.add_argument("chain")
+
+    follow = sub.add_parser("follow", help="follow the active chain log across continuation hops")
+    follow.add_argument("chain")
+    follow.add_argument("-n", "--lines", type=int, default=10, help="initial lines to show from the current log (default: 10)")
+    follow.add_argument("--poll-interval", type=float, default=1.0, help=argparse.SUPPRESS)
 
     submission_status = sub.add_parser(
         "submission-status", help="summarize all autonomous chains belonging to one submission"
@@ -524,6 +532,11 @@ def _find_chain(chain: str) -> Path:
     raise ConfigError(f"chain or job id {chain!r} not found under {root}")
 
 
+def cmd_help(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    parser.print_help()
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     path = _find_chain(args.chain)
     state = load_state(path)
@@ -558,6 +571,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         print("logs:    no known Slurm job logs yet")
     return 0
+
+
+def cmd_follow(args: argparse.Namespace) -> int:
+    path = _find_chain(args.chain)
+    try:
+        return follow_chain(path, initial_lines=args.lines, poll_interval=args.poll_interval)
+    except KeyboardInterrupt:
+        print("\n[follow] interrupted", file=sys.stderr)
+        return 130
 
 
 def _format_bytes(value: int) -> str:
@@ -674,12 +696,14 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = {"init", "config", "submit", "submit-manifest", "status", "submission-status", "cleanup", "gc", "cancel"}
+    commands = {"help", "init", "config", "submit", "submit-manifest", "status", "follow", "submission-status", "cleanup", "gc", "cancel"}
     top_level = {"-h", "--help", "--version"}
     if argv and argv[0] not in commands and argv[0] not in top_level:
         argv.insert(0, "submit")
     args = parser.parse_args(argv)
     try:
+        if args.subcommand == "help":
+            return cmd_help(args, parser)
         if args.subcommand == "init":
             return cmd_init(args)
         if args.subcommand == "config":
@@ -690,6 +714,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_submit_manifest(args)
         if args.subcommand == "status":
             return cmd_status(args)
+        if args.subcommand == "follow":
+            return cmd_follow(args)
         if args.subcommand == "submission-status":
             return cmd_submission_status(args)
         if args.subcommand == "cleanup":
