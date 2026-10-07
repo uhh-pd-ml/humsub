@@ -1,404 +1,308 @@
 # hummel-submit (`humsub`)
 
-`humsub` is a small Hummel-2 frontend and a law backend for restartable Slurm jobs.
+`humsub` runs applications on the Hummel-2 Slurm cluster as **autonomous job chains**: a job that
+would exceed the partition's time limit is stopped shortly before the limit and continued in a
+follow-up Slurm job, without you resubmitting it.  Workflows are expressed with
+[law](https://github.com/riga/law); `humsub` is law's batch-system backend for Hummel plus a small
+command line.
 
-Version 0.3 changes the architecture deliberately:
+Two ways to use it:
 
-- **law** owns workflow semantics: tasks, branches, targets, dependencies, merging and normal failure handling.
-- **humsub's Hummel contrib** behaves like a batch system from law's point of view.
-- A remote law job is wrapped in an autonomous **chain** of real Slurm jobs.
-- law only sees the stable chain id; changing inner Slurm job ids never leak into law.
-- Hummel-specific path policy, Slurm options and pre-timeout continuation remain in humsub.
+| mode | command | for |
+|---|---|---|
+| **manifest** (recommended) | `humsub submit-manifest` | many independent units of work ("branches"), each producing declared output files, run by *your* payload script |
+| **single command** | `humsub submit -- ARGS` | one long restartable command (e.g. GPU training that resumes from checkpoints), optionally in an Apptainer container |
 
-This is the autonomous continuation model. It is intentionally separate from a planned generic law feature where a special remote-job result can ask law itself to resubmit the job.
+`humsub` owns scheduling, staging of inputs, branch scratch, Slurm submission, continuation,
+status/log following and cleanup.  Your payload owns what a branch *does*.  Nothing in `humsub`
+knows about any particular science application.
 
-## Architecture
+## Terminology
 
-```text
-humsub frontend
-    |
-    v
-law workflow / remote job rendering
-    |
-    v
-HummelJobManager
-    |  submit() -> stable chain id
-    |  query(chain id)
-    |  cancel(chain id)
-    v
-humsub autonomous chain
-    |
-    +-- Slurm job A
-    |      pre-timeout USR1
-    |      explicit continuation marker
-    |
-    +-- Slurm job B
-    |
-    +-- Slurm job C ...
-```
+| term | meaning |
+|---|---|
+| **submission** | one `submit`/`submit-manifest` invocation (id `YYYYMMDD-HHMMSS-xxxxxxxx`); owns frozen manifest, payload, staged inputs |
+| **branch** | logical law unit of work: one manifest entry with its data and declared outputs |
+| **chain** | stable identity (chain id) of one law remote job across continuation hops; what `status`, `follow`, `cancel` take |
+| **job** | an actual Slurm job (Slurm job id).  A chain consists of one or more jobs |
+| **hop** | one Slurm allocation in a chain (hop 0 = first job) |
+| **continuation** | the *expected* extension of the same logical execution: a hop is stopped by the pre-timeout signal and the next hop re-runs the same law job |
+| **retry** | a *new attempt after a failure* (law-level, `--wait --retries N`); a failed chain does not continue |
+| **stage** | named input file/directory frozen (copied) at submission, so later edits do not affect running jobs |
 
-The law-generated remote-job script is stored persistently on BeeGFS. Each chain hop executes the same script. If a previous law branch already produced its target, law/Luigi naturally considers it complete when the payload is invoked again.
+`--tasks-per-job K` runs K branches one after another inside one chain (default 1: one chain per branch).
 
-The chain layer does **not** understand law branches, application checkpoints or scientific outputs. It only understands scheduler lifetime. This keeps law as the single source of truth for workflow completion.
+## Install
 
-## law version
-
-Development currently targets Marcel Rieger's major law rewrite on the public `release_prep` branch, not the legacy 0.1 API. `pyproject.toml` therefore depends directly on:
-
-```text
-git+https://github.com/riga/law.git@release_prep
-```
-
-The law-specific integration is isolated under `hummel_submit.contrib.hummel` so later API changes are confined to a small adapter.
-
-## Installation
-
-Requires Python 3.11 or newer. On Hummel, install downloaded Python software under `$USW`:
+Needs Python ≥ 3.11 and `rsync` (present on Hummel).  Install software under `$USW`:
 
 ```bash
 python3 -m venv "$USW/venvs/hummel-submit"
-"$USW/venvs/hummel-submit/bin/pip" install .
+"$USW/venvs/hummel-submit/bin/pip" install .          # also installs law (release_prep branch) from GitHub
 mkdir -p "$HOME/.local/bin"
 ln -sf "$USW/venvs/hummel-submit/bin/humsub" "$HOME/.local/bin/humsub"
+humsub --version
 ```
 
-Installing the package also installs law from `release_prep`. The Python interpreter and the resulting `law` executable must remain visible at the same absolute path on compute nodes. `/usw` being read-only there is fine.
+The venv's interpreter and its `law` executable must be visible at the same absolute path on
+the compute nodes (`$USW` is; it is read-only there, which is fine).  The install is a copy:
+**re-run `pip install --no-deps .` after changing the source**.  Chains already submitted keep the
+frozen worker they were started with.
 
-## First-time setup
+## Quickstart (no CMS, no GPU)
 
-Run in a project directory:
+[`examples/hello`](examples/hello) is a complete minimal application: four branches, each computes
+`factor * n(n+1)/2` using a staged input file, and writes one JSON file.
 
 ```bash
-humsub init
+cd examples/hello            # contains .hummel-submit.toml, make_manifest.py, payload.py, run.sh
+./run.sh my-first-run
 ```
 
-This creates, without overwriting existing files:
-
-- `~/.config/hummel-submit/config.toml` — personal fallback settings
-- `./.hummel-submit.toml` — project-specific settings
-
-Precedence is built-in defaults → personal config → project config → selected `HUMMEL_*` environment overrides → explicit submit CLI overrides.
-
-Show the resolved configuration with:
+which does the following (edit `account` in `.hummel-submit.toml` first):
 
 ```bash
-humsub config
+# 1. manifest: which branches exist, with which data, producing which files
+python3 make_manifest.py "$BEEGFS/humsub-examples/my-first-run"      # -> manifest.json
+# 2. stage the input and submit (returns as soon as the Slurm jobs are queued)
+humsub submit-manifest --manifest manifest.json --payload ./payload.py \
+       --stage lookup=./lookup --run-name my-first-run
 ```
 
-## Hummel-2 storage model
-
-```text
-$HOME       source/config written by the user; backed up; READ-ONLY in batch jobs
-$USW        installed software/containers;          READ-ONLY in batch jobs
-$BEEGFS     large persistent data/checkpoints/logs; writable, good streaming I/O
-$SSD        small-file/random-I/O scratch/caches;    writable, no backup/redundancy
-/tmp        per-job RAM filesystem;                  writable, counts as job memory
-/dev/shm    per-job RAM filesystem;                  writable, counts as job memory
-```
-
-Default personal settings are therefore essentially:
-
-```toml
-[execution]
-output_dir = "${BEEGFS}/jobs"
-cache_dir = "${SSD}/.hummel-submit/cache"
-binds = ["${BEEGFS}", "${USW}", "${SSD}"]
-```
-
-A submission creates two kinds of persistent state below `output_dir`:
-
-```text
-.hummel-submit/
-  submissions/<submission-id>/
-    submission.json
-    law/
-      bootstrap.sh
-      control/
-      job-files/
-
-  chains/<chain-id>/
-    state.json
-    worker.sh
-    hummel-submit-worker.zip
-```
-
-The persistent law job-file directory is important: an autonomous successor can run long after the submission-side law process and its temporary directories have disappeared.
-
-## Example project config
-
-```toml
-[execution]
-image = "${USW}/containers/myproject-latest.sif"
-command = ["my-train"]
-auto_args = [
-  "--run={RUN}",
-  "--output={RUN_DIR}",
-  "--strategy={STRATEGY}",
-  "--checkpoint={CKPT}",
-]
-checkpoint_glob = "checkpoints/*.ckpt"
-env_file = ".env"
-
-[slurm]
-job_name = "training"
-partition = "gpu"
-nodes = 1
-gpus = 1
-time_limit = "4:00:00"
-max_hops = 20
-extra_args = ["--cpus-per-task=8"]
-
-[validation]
-writable_args = ["--tensorboard-dir"]
-```
-
-`checkpoint_glob` remains an application-level convenience used by the built-in single-payload law workflow. The generic Hummel chain backend itself is checkpoint-agnostic.
-
-## Submission-time path validation
-
-Before invoking law, `humsub` validates paths that it knows must be writable and performs a conservative scan of path-like payload arguments.
-
-It always checks `execution.output_dir` and `execution.cache_dir`. `/home` and `/usw` are hard errors for write targets because both are read-only in Hummel batch jobs. The persistent output directory must also be shared across hops, so `/tmp`, `/dev/shm`, Hummel-managed temporary BeeGFS directories and node-specific NVMe-oF storage are rejected for `output_dir`.
-
-For application arguments:
-
-- an existing path is treated as an input unless its option name is clearly output-like;
-- a nonexistent path is treated as something the job is likely to create and is checked for compute-node writability;
-- common output names such as `--output`, `--output-dir`, `--save-dir`, `--checkpoint-path`, `--log-file` and `--cache-dir` are recognized;
-- additional write options can be declared in `[validation].writable_args`;
-- existing symlink prefixes are resolved before filesystem classification.
-
-Use `--skip-path-checks` only as an explicit escape hatch.
-
-## Submitting
+Then:
 
 ```bash
-humsub submit -- --epochs=100 --learning-rate=1e-3
+humsub submission-status SUBMISSION_ID   # one line per chain: pending / running / finished / failed
+humsub status CHAIN_ID                   # jobs, queue state, log path of every hop
+humsub follow CHAIN_ID                   # tail -f the active log, switching to the next hop automatically
+cat "$BEEGFS/humsub-examples/my-first-run"/sum-*.json            # the outputs, where the manifest said
+humsub cleanup SUBMISSION_ID             # delete the staged inputs on the SSD once finished
 ```
 
-`submit` remains the implicit default:
+`SUBMISSION_ID` and the chain ids are printed by `submit-manifest`.
 
-```bash
-humsub --dry-run -- --epochs=100
-humsub --no-resubmit -- --smoke-test
-```
-
-The frontend now does the following:
-
-1. resolves and validates the humsub configuration;
-2. freezes a submission specification;
-3. instantiates the built-in one-branch law workflow;
-4. asks law to render and submit the remote job;
-5. `HummelJobManager` wraps that rendered job in an autonomous chain;
-6. law stores the **chain id** as its remote job id.
-
-The CLI uses law with `no_poll=True` to retain the original non-blocking `humsub submit` behavior. More sophisticated projects can import `HummelWorkflow` and let law poll/control workflows normally.
-
-One-off Slurm overrides are unchanged:
-
-```bash
-humsub submit --time 12:00:00 -- --epochs=100
-humsub submit --reservation kasieczka -- --epochs=2
-humsub submit --sbatch-arg=--exclude=g002 -- --epochs=100
-```
-
-Hummel-specific invariants remain enforced: `--export=NONE`, `/sw/batch/init.sh` first in the chain worker, no `srun`, no explicit memory request, and no user-supplied dependency/signal options that would break continuation semantics.
-
-## Autonomous continuation
-
-Each hop pre-queues one `afterany` follower. That follower starts useful work only when the preceding hop wrote an explicit continuation marker after receiving Slurm's pre-timeout `USR1` signal.
-
-A normal sequence is:
-
-```text
-Slurm A: run law payload
-         receive USR1
-         mark continuation
-         terminate payload process group
-         exit successfully
-
-Slurm B: verify marker
-         execute the same law payload again
-```
-
-From law's point of view the job is still the same stable chain id and remains running. The inner Slurm ids are implementation details recorded in the chain state.
-
-A plain application failure does **not** continue. The waiting follower is cancelled, the chain becomes failed, and `HummelJobManager.query(chain_id)` reports a law failure.
-
-## Status and cancellation
-
-Submission prints the stable chain id:
-
-```bash
-humsub status 20261001-140501-a1b2c3d4
-humsub cancel 20261001-140501-a1b2c3d4
-```
-
-A known inner Slurm job id can still be supplied to the CLI for convenience; humsub resolves it back to its chain.
-
-`humsub status` also lists the deterministic Slurm log path for every known hop, marking the current and queued successor jobs and whether each log file already exists.  For interactive monitoring, `humsub follow CHAIN_ID` behaves like `tail -f` on the active log and automatically switches to the successor log when an autonomous continuation hop takes over.  The first log starts with its last 10 lines (configurable with `-n`); successor logs are read from the beginning so startup output is not missed.
-
-`HummelJobManager.cancel(chain_id)` cancels all known inner Slurm jobs and marks the chain terminal. law therefore never needs to know which inner job is currently active.
-
-## Using the Hummel contrib from custom law workflows
-
-The generic command-line workflow is intentionally small. Framework integrations should define normal law tasks and inherit the Hummel workflow backend directly:
-
-```python
-import law
-
-from hummel_submit.contrib.hummel import HummelWorkflow
-
-
-class MyTask(HummelWorkflow, law.LocalWorkflow):
-    # humsub_spec is supplied by the frontend/framework integration
-
-    def create_branch_map(self):
-        return {...}
-
-    def output(self):
-        ...
-
-    def run(self):
-        ...
-```
-
-This remains the extension point for workflows that need custom law task classes.  Independent branch/payload applications should prefer `humsub submit-manifest`. Splitting, dependencies and merging belong in law tasks; Hummel-specific scheduling and autonomous continuation stay in the contrib.
-
-## Frozen chain worker
-
-Each chain still stores a ZIP snapshot of the installed humsub Python worker plus `worker.sh`. Package upgrades therefore cannot alter continuation mechanics halfway through an existing chain.
-
-The law remote-job script and its rendered inputs are stored separately in the submission's persistent law job-file directory. The chain executes this immutable rendered payload on every hop.
-
-## Testing
-
-The scheduler-independent unit tests can be run with:
-
-```bash
-PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py' -v
-```
-
-A full integration test additionally requires the `release_prep` law dependency and a Slurm/Hummel environment.
-
-## Generic manifest payload workflows
-
-Version 0.4 adds a generic application boundary for workflows whose work can be
-expressed as independent branches.  The application provides:
-
-1. a JSON manifest describing branch data and declared outputs;
-2. one executable payload that knows how to run a single branch; and
-3. optional named files/directories that humsub freezes into submission-owned
-   staging paths.
-
-humsub owns law/Luigi integration, Hummel submission, autonomous continuation,
-host virtualenv restoration, immutable payload/manifest copies, branch scratch,
-and output-completeness checks.
-
-Example manifest:
+## The manifest
 
 ```json
 {
   "schema": 1,
-  "common": {"application": "example"},
+  "common": {"anything": "shared by all branches"},
   "branches": [
-    {
-      "id": 0,
-      "data": {"input": "/some/input"},
-      "outputs": ["/beegfs/user/jobs/example/output-0.dat"]
-    }
+    {"id": 0, "data": {"n": 10}, "outputs": ["/beegfs/.../out-0.json"]},
+    {"id": 1, "data": {"n": 100}, "outputs": ["/beegfs/.../out-1.json", "/beegfs/.../out-1.log"]}
   ]
 }
 ```
 
-Submit it with:
+* `schema` must be `1`.  `common` is optional, free-form JSON.
+* `branches` is a non-empty list; `id` is a unique non-negative integer; `data` is optional free-form JSON.
+* `outputs` is a non-empty list of **absolute paths on shared, batch-writable storage** (`$BEEGFS`, or `$SSD`; `/home`, `/usw`,
+  `/tmp` and `/dev/shm` are rejected at submission).  **A branch is complete exactly when all of its outputs
+  exist.**  This is law's completeness test, so it also makes submission idempotent: re-submitting a
+  manifest launches only branches with missing outputs, and says "nothing to submit" if none are missing.
 
-```bash
-humsub submit-manifest \
-  --manifest branches.json \
-  --payload ./run-branch.py \
-  --stage source=/home/user/my-source \
-  --run-name example-001
-```
+## The payload
 
-Large directory stages can be filtered at freeze time with repeatable
-`--stage-exclude NAME=PATTERN` options.  This keeps generated build trees,
-caches, and previous outputs out of immutable submission snapshots without
-putting application-specific copy logic into the payload:
-
-```bash
-humsub submit-manifest \
-  --manifest branches.json \
-  --payload ./run-branch.py \
-  --stage source=/home/user/my-source \
-  --stage-exclude 'source=build' \
-  --stage-exclude 'source=*.root' \
-  --run-name example-001
-```
-
-When `rsync` is available, patterns use its `--exclude` matching semantics.
-
-The payload is invoked as:
+`--payload` is any executable (a script with a shebang is fine).  `humsub` copies it into the
+submission and runs it once per branch, in the project directory, as
 
 ```text
-/path/to/frozen/payload /path/to/frozen/branch-context.json
+payload BRANCH_CONTEXT.json
 ```
 
-The context combines top-level `common`, branch-specific `data`, `outputs`, and
-submission-specific `stages`.  In addition, humsub exports:
+`BRANCH_CONTEXT.json` is frozen at submission and contains:
+
+```json
+{"schema": 1, "submission_id": "…", "run_name": "…", "run_dir": "…", "branch": 3,
+ "common": {…}, "data": {…}, "outputs": ["/abs/out-3.json"], "stages": {"lookup": "/staged/path"}}
+```
+
+Environment (in addition to what the Hummel batch environment provides; jobs start from `--export=NONE`):
+
+| variable | value |
+|---|---|
+| `HUMSUB_BRANCH_FILE` | path of the context JSON (= `argv[1]`) |
+| `HUMSUB_BRANCH` | branch id |
+| `HUMSUB_SUBMISSION_ID`, `HUMSUB_RUN_NAME`, `HUMSUB_RUN_DIR` | identity of the submission; `RUN_DIR` = `<output_dir>/runs/<run>` (created, empty) |
+| `HUMSUB_SCRATCH` | private empty directory for this branch, under `cache_dir` on the SSD; **removed when the branch ends** (success or failure) |
+| `HUMSUB_STAGE_<NAME>` | staged path of `--stage NAME=…` (name upper-cased, non-alphanumerics → `_`) |
+| `HUMSUB_PAYLOAD` | path of the frozen payload |
+| `HUMSUB_ATTEMPT` | law attempt number (1 on the first try, +1 per `--retries`) |
+| `HUMSUB_CHAIN_ID`, `HUMSUB_HOP`, `HUMSUB_STATE_PATH` | chain id, hop number (0-based) and state file of the surrounding chain |
+
+Rules:
+
+1. **Exit 0 and create every declared output**, otherwise the branch fails.  Before each run
+   `humsub` deletes any outputs left by a failed attempt, and after a failure it deletes whatever the payload
+   wrote to the declared paths, so a partial output cannot make a retry look complete.
+2. **Write atomically** (temporary name next to the target, then rename): outputs on BeeGFS and scratch on the SSD
+   are different filesystems, so copy from scratch to a temporary name beside the target and rename that.
+3. **Be restartable.**  A hop ends with SIGTERM to the payload's process group shortly before the time limit; the
+   next hop re-runs the whole branch from the beginning (branches that already completed are skipped, a
+   branch that was running is restarted).  Branches should therefore be much shorter than `time_limit`, or
+   checkpoint on their own.
+4. **Containers belong inside the payload** (law and the chain run on the host).  A payload that needs a
+   runtime calls it itself, e.g. `cmsexec …` or `apptainer exec …`.
+5. `$HOME` and `$USW` are read-only in batch; write to `$BEEGFS`, `$SSD` or `HUMSUB_SCRATCH`.
+
+### Stages
+
+`--stage NAME=PATH` (repeatable) copies a file or directory into `<cache_dir>/stages/<submission>/NAME`
+(immutable for the life of the submission) and exposes it as `context["stages"]["NAME"]` and
+`HUMSUB_STAGE_NAME`.  `--stage-exclude NAME=PATTERN` (repeatable) skips matching files while copying a
+directory; patterns use `rsync --exclude` syntax, so a leading `/` anchors at the stage root:
+
+```bash
+--stage src=$HOME/my-source --stage-exclude 'src=/build/' --stage-exclude 'src=*.root'
+```
+
+Stages live on the SSD and are kept after the run so failures stay reproducible; remove them with
+`humsub cleanup` / `humsub gc` (below).
+
+## Configuration
+
+Settings come from TOML files, lowest to highest precedence: built-in defaults → `~/.config/hummel-submit/config.toml`
+→ `./.hummel-submit.toml` (current directory) → `HUMMEL_*` environment variables → command-line options.
+`humsub init` writes annotated templates (never overwrites); `humsub config` shows the resolved result.
+
+```toml
+[execution]
+output_dir = "${BEEGFS}/jobs"                  # run state, chains, logs, runs/<run>; shared + persistent
+cache_dir  = "${SSD}/.hummel-submit/cache"     # stages, branch scratch; SSD
+# single-command mode only:
+image = "none"                                 # Apptainer image or "none"
+command = []                                   # argv prefix, e.g. ["python", "train.py"]
+auto_args = []                                 # --key={RUN}/{RUN_DIR}/{NGPU}/{STRATEGY}/{CKPT} placeholders
+checkpoint_glob = ""                           # relative to the run dir; newest match is {CKPT} on hops > 0
+env_file = ".env"                              # KEY=VALUE lines, never executed as shell
+binds = ["${BEEGFS}", "${USW}", "${SSD}"]
+nv = true                                      # apptainer --nv
+
+[slurm]
+job_name = "job"      account = "kasieczka_gpu"   partition = "gpu"   nodes = 1   gpus = 1
+time_limit = "24:00:00"     # per hop
+signal_seconds = 600        # a hop is stopped this long BEFORE time_limit; must be < time_limit
+max_hops = 20               # at most this many Slurm jobs per chain
+mail = ""   reservation = ""
+extra_args = []             # e.g. ["--cpus-per-task=8"]; --mem* is forbidden on Hummel
+[validation]
+writable_args = []          # single-command mode: option names whose value must be writable
+```
+
+* In **manifest mode** only `output_dir`, `cache_dir` and `[slurm]` matter; `image`, `command`, `binds` … are ignored.
+* `time_limit` must exceed `signal_seconds` whenever continuation is on (`max_hops > 1` and no
+  `--no-resubmit`); otherwise the stop signal arrives right after the job starts and every hop is cut
+  short.  `humsub` rejects such a configuration.
+* Environment overrides: `HUMMEL_IMAGE`, `HUMMEL_OUTPUT_DIR`, `HUMMEL_CACHE_DIR`, `HUMMEL_ACCOUNT`,
+  `HUMMEL_PARTITION`, `HUMMEL_TIME_LIMIT`, `HUMMEL_MAIL`, `HUMMEL_RESERVATION`, `HUMMEL_MAX_HOPS`.
+* Always set by `humsub` (not overridable via `extra_args`): `--export=NONE`, `--signal`, `--output`, `--chdir`,
+  account/partition/nodes/gpus/time, dependency.  Jobs source `/sw/batch/init.sh` first, use no `srun`.
+
+Storage on Hummel-2: `$HOME` and `$USW` are read-only in batch; `$BEEGFS` is for large persistent data and
+logs; `$SSD` for small-file/random I/O and caches (no backup; 100 GiB quota); `/tmp` is RAM and counts as job memory.
+
+## Command reference
 
 ```text
-HUMSUB_SUBMISSION_ID
-HUMSUB_RUN_NAME
-HUMSUB_RUN_DIR
-HUMSUB_BRANCH
-HUMSUB_BRANCH_FILE
-HUMSUB_SCRATCH
-HUMSUB_ATTEMPT
-HUMSUB_STAGE_<NAME>
+humsub init [--project-only | --user-only]     write config templates
+humsub config [--json]                         show resolved configuration
+humsub submit-manifest --manifest M --payload P [--stage N=PATH]… [--stage-exclude N=PATTERN]…
+        [--run-name NAME] [--wait] [--retries R] [--tasks-per-job K] [--parallel-jobs J] [--dry-run]
+        [--no-resubmit] [--time T] [--account A] [--partition P] [--reservation R] [--mail M]
+        [--max-hops H] [--sbatch-arg ARG]… [--skip-path-checks]
+humsub submit [same Slurm options] [--dry-run] [--run-name NAME] -- ARGS…      single-command mode
+humsub submission-status SUBMISSION            chains of a submission and their states
+humsub status CHAIN                            one chain: state, jobs, queue, log paths
+humsub follow CHAIN [-n LINES]                 follow the active log across hops; exit code = chain result
+humsub cancel CHAIN                            scancel all jobs of the chain and mark it failed
+humsub cleanup SUBMISSION [--dry-run] [--force]
+humsub gc [--apply] [--successful-after-hours H] [--failed-after-hours H] [--orphans-after-hours H]
+humsub help                                    same as --help
 ```
 
-For example, `--stage das=/path/to/source` becomes `HUMSUB_STAGE_DAS`.
-Applications should write outputs atomically (e.g. into `HUMSUB_SCRATCH` first,
-then rename/move them to the declared output paths).  On payload failure humsub
-removes declared file targets so a partial output cannot make law consider a
-retry complete.
+`CHAIN` is the chain id or any of its Slurm job ids.  Any first argument that is not a subcommand is
+treated as `submit` (`humsub -- --epochs=3` ≡ `humsub submit -- --epochs=3`).
 
-`--wait` keeps law alive for controller-side retries and bounded rolling
-submission.  Without `--wait`, use `--parallel-jobs=0` (the default) when all
-branches should be submitted immediately.  Failure retries require `--wait`.
+### Submit options in detail
 
-A complete submission can be summarized with:
+* Default: `submit-manifest` returns once all chains are queued ("fire and forget"); law is not kept alive.
+* `--wait` keeps the submitting law process alive to poll the chains and to retry failed branches
+  (`--retries R`, only with `--wait`) and to apply `--parallel-jobs J` (at most J chains active at once;
+  default `0` = submit everything immediately, which is also the only sensible value without `--wait`).
+  Use it in `tmux`/`screen`; if it dies, running chains are unaffected.
+* `--no-resubmit`: no continuation — a single Slurm job per chain, no stop signal.
+* `--dry-run`: validate the manifest, stages and paths and print the plan; submit nothing.
+* Path checks run before anything is created (`--skip-path-checks` disables them): shared output
+  directory, writable cache directory, every declared output location.
+
+### Retrying
+
+A failed chain (payload exit ≠ 0, or outputs missing) is **not** continued.  Either run with
+`--wait --retries R` or, after fixing the cause, run the same `submit-manifest` again with a fresh `--run-name`:
+branches whose outputs exist are skipped, the rest run again.
+
+### Cleaning up
+
+| what | where | removed by |
+|---|---|---|
+| frozen submission, chain state, rendered law jobs, Slurm logs | `<output_dir>/.hummel-submit/…`, `<output_dir>/logs/<job_name>_<jobid>.log` | never (provenance); delete by hand |
+| staged inputs | `<cache_dir>/stages/<submission>` | `humsub cleanup`, `humsub gc` |
+| branch scratch | `<cache_dir>/payload-work/<submission>/…` | the branch itself; `cleanup`/`gc` for leftovers |
+
+`cleanup SUBMISSION` removes the two cache trees of one finished submission (active ones are refused without
+`--force`).  `gc` considers all submissions of the current project: it only reports unless `--apply`; defaults:
+successful after 24 h, failed after 168 h.  `--orphans-after-hours H` additionally removes cache directories
+no submission of this `output_dir` refers to — submissions made by this version carry an owner marker, so
+other projects' live staging in a shared `cache_dir` is spared, but **staging from older versions is
+indistinguishable from an orphan**: use a large `H`.  CVMFS/`cmsexec` caches are not touched by `humsub` at all.
+
+## Troubleshooting
+
+| symptom | cause / action |
+|---|---|
+| `time_limit … must be longer than signal_seconds` | lower `signal_seconds` or raise `time_limit` (see Configuration) |
+| chain ends `stopped-no-follower` | a hop hit the time limit but `max_hops` was exhausted: raise `max_hops`, or make branches shorter |
+| chain ends `stopped-no-continuation-marker` | the follower started although the previous hop did not request continuation (e.g. it was killed): inspect the previous log, resubmit |
+| chain `failed-<rc>` | payload/law exit code `rc`; read the log (`humsub status CHAIN` prints it) |
+| `payload returned success but did not materialize declared output(s)` | the payload exited 0 without creating all `outputs` |
+| `… must be on shared storage / is read-only in batch` | path check: use `$BEEGFS`/`$SSD`, not `$HOME`, `$USW`, `/tmp` |
+| `unresolved environment variable` | run on a Hummel frontend (or define `BEEGFS`, `SSD`, `USW`) |
+| `law executable not found` | the venv's `bin/law` must sit next to its `python`; reinstall the venv |
+| old behaviour after editing the source | `pip install --no-deps .` again; running chains keep their frozen worker |
+
+On disk, `<output_dir>/.hummel-submit/submissions/<id>/submission.json` and `chains/<id>/state.json` are
+plain JSON and the first things to read when something looks wrong.
+
+## How it works
+
+```text
+humsub submit-manifest
+  → freeze manifest, payload, stages  → law workflow (one law branch per manifest branch)
+  → law renders a remote-job script, HummelJobManager wraps it in a chain
+  → chain hop = Slurm job: worker.sh → hummel_submit.worker
+        runs the law job script; on SIGUSR1 (signal_seconds before the limit) it writes continue-<hop>,
+        SIGTERMs the payload group and exits 0; a follower queued with `afterany` starts the next hop
+        only if that marker exists; on success/failure the follower is cancelled
+  → law sees only the stable chain id (pending / running / finished / failed)
+```
+
+Each chain stores a ZIP snapshot of the worker code, so upgrading the package cannot change a running
+chain.  law and the chain run in the Hummel host environment; the payload decides about containers.
+Custom law workflows can inherit `hummel_submit.contrib.hummel.HummelWorkflow` directly; independent
+branches should prefer manifest mode.  The law integration is isolated in `hummel_submit/contrib/hummel`.
+
+## Single-command mode
+
+`humsub submit -- --epochs=100` runs `[execution].command` plus `auto_args` plus your arguments in one
+chain, optionally inside `image` (Apptainer with `--nv` unless `nv = false`, `binds`).  On hops after the
+first, `{CKPT}` expands to the newest `checkpoint_glob` match.  Arguments that look like output paths
+are checked for writability before submission.  Per-submission overrides: `--time`, `--account`, `--partition`,
+`--reservation`, `--mail`, `--max-hops`, `--sbatch-arg=…`, `--no-resubmit`, `--dry-run`.
+
+## Development
 
 ```bash
-humsub submission-status <submission-id>
+pip install pytest && PYTHONPATH=src python -m pytest -q        # scheduler-independent unit tests
 ```
 
-### Host runtime boundary
-
-law itself always runs in the Hummel host environment.  The exact submission
-Python and law executable paths are frozen into `submission.json` and rendered
-into law's remote script without resolving virtualenv symlinks.  Application
-containers belong inside the application payload, not around the law remote
-job.  This avoids host/container glibc mismatches and keeps the scheduler layer
-independent of application runtime choices such as Apptainer or `cmsexec`.
-
-## Cache cleanup and garbage collection
-
-Manifest workflows keep frozen staged inputs on the configured SSD cache after submission so failed jobs remain reproducible.  Per-branch `payload-work` scratch is removed after normal success or failure.
-
-Use `humsub cleanup SUBMISSION_ID` to remove the SSD `stages/` and `payload-work/` trees for a terminal submission while preserving BeeGFS submission metadata, outputs, chain state, and logs.  Active submissions are refused unless `--force` is passed.
-
-`humsub gc` is safe by default and only reports what it would remove.  Defaults are successful submissions older than 24 hours and failed submissions older than 168 hours (7 days):
-
-```bash
-humsub gc
-humsub gc --apply
-```
-
-Optional orphan cleanup is explicit, for example `humsub gc --orphans-after-hours 48 --apply`.  This can remove cache directories whose submission metadata no longer exists under the current configured output directory.
-
-
-## CLI help
-
-`humsub help` is an alias for the top-level `humsub -h` help output.
+A real end-to-end test needs Slurm: run `examples/hello/run.sh` on a frontend.
