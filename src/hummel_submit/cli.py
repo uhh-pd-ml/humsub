@@ -17,7 +17,15 @@ from .cleanup import (
     remove_cache_paths,
     stale_orphan_cache_dirs,
 )
-from .config import ConfigError, PROJECT_CONFIG_NAME, USER_CONFIG, config_as_json, load_config, validate_run_name
+from .config import (
+    ConfigError,
+    PROJECT_CONFIG_NAME,
+    USER_CONFIG,
+    check_signal_window,
+    config_as_json,
+    load_config,
+    validate_run_name,
+)
 from .pathcheck import PathCheckError, check_compute_writable, check_payload_args
 from .slurm import SlurmError, queue_status, sbatch_command, slurm_log_path
 from .state import chain_root, default_run_name, load_state
@@ -27,8 +35,25 @@ from .staging import parse_stage_exclude, parse_stage_spec, stage_inputs
 from .templates import PROJECT_TEMPLATE, USER_TEMPLATE
 
 
+def _add_slurm_options(parser: argparse.ArgumentParser) -> None:
+    """Per-submission overrides of [slurm] settings (shared by submit and submit-manifest)."""
+    parser.add_argument("--no-resubmit", action="store_true", help="no continuation hops: the job runs once, in a single Slurm job")
+    parser.add_argument("--time", dest="time_limit", help="time limit of each hop, e.g. 04:00:00")
+    parser.add_argument("--account", help="Slurm account")
+    parser.add_argument("--partition", help="Slurm partition")
+    parser.add_argument("--reservation", help="Slurm reservation")
+    parser.add_argument("--mail", help="e-mail address for failure notifications")
+    parser.add_argument("--max-hops", type=int, help="maximum number of Slurm jobs (hops) in one chain")
+    parser.add_argument("--sbatch-arg", action="append", default=[], help="extra sbatch option (repeatable), e.g. --sbatch-arg=--cpus-per-task=8")
+    parser.add_argument("--skip-path-checks", action="store_true", help="skip Hummel filesystem/path validation (escape hatch)")
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="humsub", description="law-backed Hummel-2 submission helper")
+    parser = argparse.ArgumentParser(
+        prog="humsub",
+        description="law-backed Hummel-2 submission helper: run a command or a manifest of independent branches "
+        "as autonomous Slurm job chains (see README.md)",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
@@ -41,18 +66,10 @@ def _parser() -> argparse.ArgumentParser:
     show.add_argument("--json", action="store_true", help="print machine-readable JSON")
 
     submit_p = sub.add_parser("submit", help="submit a law workflow for the configured payload")
-    submit_p.add_argument("--dry-run", action="store_true")
-    submit_p.add_argument("--no-resubmit", action="store_true")
-    submit_p.add_argument("--run-name")
-    submit_p.add_argument("--time", dest="time_limit")
-    submit_p.add_argument("--account")
-    submit_p.add_argument("--partition")
-    submit_p.add_argument("--reservation")
-    submit_p.add_argument("--mail")
-    submit_p.add_argument("--max-hops", type=int)
-    submit_p.add_argument("--sbatch-arg", action="append", default=[], help="append an extra sbatch option; repeat as needed")
-    submit_p.add_argument("--skip-path-checks", action="store_true", help="skip Hummel filesystem/path validation (escape hatch)")
-    submit_p.add_argument("args", nargs=argparse.REMAINDER)
+    submit_p.add_argument("--dry-run", action="store_true", help="validate and print the sbatch command without submitting")
+    submit_p.add_argument("--run-name", help="unique run name (default: run-<timestamp>-<id>); names the run directory")
+    _add_slurm_options(submit_p)
+    submit_p.add_argument("args", nargs=argparse.REMAINDER, help="arguments passed to [execution].command (after --)")
 
     manifest = sub.add_parser(
         "submit-manifest",
@@ -68,43 +85,41 @@ def _parser() -> argparse.ArgumentParser:
         "--stage-exclude", action="append", default=[], metavar="NAME=PATTERN",
         help="exclude a pattern while freezing a directory stage; repeat as needed",
     )
-    manifest.add_argument("--run-name")
+    manifest.add_argument("--run-name", help="unique run name (default: run-<timestamp>-<id>)")
     manifest.add_argument("--wait", action="store_true", help="keep law alive to poll and retry remote jobs")
-    manifest.add_argument("--retries", type=int, default=0, help="law failure retries (requires --wait)")
-    manifest.add_argument("--tasks-per-job", type=int, default=1)
-    manifest.add_argument("--parallel-jobs", type=int, default=0, help="maximum active law jobs; 0 submits all")
-    manifest.add_argument("--dry-run", action="store_true")
-    manifest.add_argument("--no-resubmit", action="store_true")
-    manifest.add_argument("--time", dest="time_limit")
-    manifest.add_argument("--account")
-    manifest.add_argument("--partition")
-    manifest.add_argument("--reservation")
-    manifest.add_argument("--mail")
-    manifest.add_argument("--max-hops", type=int)
-    manifest.add_argument("--sbatch-arg", action="append", default=[])
-    manifest.add_argument("--skip-path-checks", action="store_true")
+    manifest.add_argument("--retries", type=int, default=0, help="law failure retries per branch (requires --wait)")
+    manifest.add_argument(
+        "--tasks-per-job", type=int, default=1,
+        help="branches run one after another in one Slurm chain (default 1: one chain per branch)",
+    )
+    manifest.add_argument(
+        "--parallel-jobs", type=int, default=0,
+        help="maximum chains active at once (needs --wait); 0 = submit all immediately (default)",
+    )
+    manifest.add_argument("--dry-run", action="store_true", help="validate the manifest, stages and paths; submit nothing")
+    _add_slurm_options(manifest)
 
     sub.add_parser("help", help="show this help message")
 
-    status = sub.add_parser("status", help="show saved chain state and current SLURM queue state")
-    status.add_argument("chain")
+    status = sub.add_parser("status", help="show saved chain state, queue state and log paths of one chain")
+    status.add_argument("chain", help="chain id (or any of its Slurm job ids)")
 
     follow = sub.add_parser("follow", help="follow the active chain log across continuation hops")
-    follow.add_argument("chain")
+    follow.add_argument("chain", help="chain id (or any of its Slurm job ids)")
     follow.add_argument("-n", "--lines", type=int, default=10, help="initial lines to show from the current log (default: 10)")
     follow.add_argument("--poll-interval", type=float, default=1.0, help=argparse.SUPPRESS)
 
     submission_status = sub.add_parser(
         "submission-status", help="summarize all autonomous chains belonging to one submission"
     )
-    submission_status.add_argument("submission")
+    submission_status.add_argument("submission", help="submission id printed by submit-manifest")
 
     cleanup = sub.add_parser(
         "cleanup",
         help="remove SSD runtime caches for one submission while preserving persistent state and logs",
     )
-    cleanup.add_argument("submission")
-    cleanup.add_argument("--dry-run", action="store_true")
+    cleanup.add_argument("submission", help="submission id")
+    cleanup.add_argument("--dry-run", action="store_true", help="only report what would be removed")
     cleanup.add_argument("--force", action="store_true", help="allow cleanup even when chains are still active")
 
     gc = sub.add_parser("gc", help="garbage-collect old SSD submission caches")
@@ -116,8 +131,8 @@ def _parser() -> argparse.ArgumentParser:
         help="also delete unreferenced cache directories older than this many hours",
     )
 
-    cancel = sub.add_parser("cancel", help="cancel the autonomous Hummel chain")
-    cancel.add_argument("chain")
+    cancel = sub.add_parser("cancel", help="cancel a chain: scancel all its Slurm jobs and mark it terminal")
+    cancel.add_argument("chain", help="chain id (or any of its Slurm job ids)")
 
     return parser
 
@@ -176,6 +191,7 @@ def cmd_config(args: argparse.Namespace) -> int:
 def _prepare_submission(args: argparse.Namespace, dry_run: bool) -> tuple[dict[str, Any], list[Path], str, list[str]]:
     project_dir = Path.cwd().resolve()
     config, sources = load_config(project_dir, _cli_overrides(args))
+    check_signal_window(config, resubmit=not args.no_resubmit)
     exe = config["execution"]
     if exe["image"] != "none" and not Path(exe["image"]).is_file():
         raise ConfigError(f"container image does not exist: {exe['image']}")
@@ -370,6 +386,7 @@ def _print_manifest_submission(spec: dict[str, Any], output_dir: Path, *, wait: 
 def cmd_submit_manifest(args: argparse.Namespace) -> int:
     project_dir = Path.cwd().resolve()
     config, sources = load_config(project_dir, _cli_overrides(args), require_command=False)
+    check_signal_window(config, resubmit=not args.no_resubmit)
     output_dir = Path(config["execution"]["output_dir"])
     cache_dir = Path(config["execution"]["cache_dir"])
     run_name = default_run_name() if args.run_name is None else validate_run_name(args.run_name)
