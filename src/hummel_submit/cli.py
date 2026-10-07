@@ -9,6 +9,13 @@ from typing import Any
 
 from . import __version__
 from .chain import cancel_chain, query_chain
+from .cleanup import (
+    cleanup_submission_cache,
+    inspect_submission_cache,
+    iter_submission_specs,
+    remove_cache_paths,
+    stale_orphan_cache_dirs,
+)
 from .config import ConfigError, PROJECT_CONFIG_NAME, USER_CONFIG, config_as_json, load_config, validate_run_name
 from .pathcheck import PathCheckError, check_compute_writable, check_payload_args
 from .slurm import SlurmError, queue_status, sbatch_command, slurm_log_path
@@ -83,6 +90,23 @@ def _parser() -> argparse.ArgumentParser:
         "submission-status", help="summarize all autonomous chains belonging to one submission"
     )
     submission_status.add_argument("submission")
+
+    cleanup = sub.add_parser(
+        "cleanup",
+        help="remove SSD runtime caches for one submission while preserving persistent state and logs",
+    )
+    cleanup.add_argument("submission")
+    cleanup.add_argument("--dry-run", action="store_true")
+    cleanup.add_argument("--force", action="store_true", help="allow cleanup even when chains are still active")
+
+    gc = sub.add_parser("gc", help="garbage-collect old SSD submission caches")
+    gc.add_argument("--apply", action="store_true", help="actually delete; without this flag gc is a dry run")
+    gc.add_argument("--successful-after-hours", type=float, default=24.0)
+    gc.add_argument("--failed-after-hours", type=float, default=168.0)
+    gc.add_argument(
+        "--orphans-after-hours", type=float, default=None,
+        help="also delete unreferenced cache directories older than this many hours",
+    )
 
     cancel = sub.add_parser("cancel", help="cancel the autonomous Hummel chain")
     cancel.add_argument("chain")
@@ -159,7 +183,7 @@ def _prepare_submission(args: argparse.Namespace, dry_run: bool) -> tuple[dict[s
     user_args = list(args.args)
     if user_args and user_args[0] == "--":
         user_args = user_args[1:]
-    run_name = validate_run_name(args.run_name) if args.run_name else default_run_name()
+    run_name = default_run_name() if args.run_name is None else validate_run_name(args.run_name)
 
     if not args.skip_path_checks:
         checks = [
@@ -347,7 +371,7 @@ def cmd_submit_manifest(args: argparse.Namespace) -> int:
     config, sources = load_config(project_dir, _cli_overrides(args), require_command=False)
     output_dir = Path(config["execution"]["output_dir"])
     cache_dir = Path(config["execution"]["cache_dir"])
-    run_name = validate_run_name(args.run_name) if args.run_name else default_run_name()
+    run_name = default_run_name() if args.run_name is None else validate_run_name(args.run_name)
 
     manifest_source = args.manifest.expanduser().absolute()
     payload_source = args.payload.expanduser().absolute()
@@ -536,6 +560,109 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_bytes(value: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    amount = float(value)
+    for unit in units:
+        if amount < 1024.0 or unit == units[-1]:
+            return f"{amount:.1f} {unit}"
+        amount /= 1024.0
+    return f"{amount:.1f} TiB"
+
+
+def _submission_spec_from_current_config(submission: str) -> Path:
+    config, _ = load_config(Path.cwd(), require_command=False)
+    output_dir = Path(config["execution"]["output_dir"])
+    path = submission_root(output_dir) / submission / "submission.json"
+    if not path.is_file():
+        raise ConfigError(f"submission {submission!r} not found under {submission_root(output_dir)}")
+    return path
+
+
+def _print_cleanup_status(status, *, prefix: str = "") -> None:
+    age = "-" if status.terminal_age_hours is None else f"{status.terminal_age_hours:.1f} h"
+    total = sum(entry.bytes for entry in status.cache_paths)
+    print(f"{prefix}submission {status.submission_id}: {status.state}, terminal age {age}, cache {_format_bytes(total)}")
+    if status.cache_paths:
+        for entry in status.cache_paths:
+            print(f"{prefix}  {entry.label:<12} {_format_bytes(entry.bytes):>10}  {entry.path}")
+    else:
+        print(f"{prefix}  no SSD runtime caches remain")
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    spec_path = _submission_spec_from_current_config(args.submission)
+    before = inspect_submission_cache(spec_path)
+    _print_cleanup_status(before)
+    if not before.cache_paths:
+        return 0
+    if args.dry_run:
+        print("cleanup: dry run; nothing removed")
+        return 0
+    cleanup_submission_cache(spec_path, force=args.force, dry_run=False)
+    print("cleanup: removed SSD runtime caches; persistent submission state, chain state, outputs and logs were preserved")
+    return 0
+
+
+def cmd_gc(args: argparse.Namespace) -> int:
+    if args.successful_after_hours < 0 or args.failed_after_hours < 0:
+        raise ConfigError("gc retention values must be >= 0 hours")
+    if args.orphans_after_hours is not None and args.orphans_after_hours < 0:
+        raise ConfigError("--orphans-after-hours must be >= 0")
+
+    config, _ = load_config(Path.cwd(), require_command=False)
+    output_dir = Path(config["execution"]["output_dir"])
+    cache_dir = Path(config["execution"]["cache_dir"])
+    specs = list(iter_submission_specs(output_dir))
+    known_ids: set[str] = set()
+    candidates = []
+    skipped_active = 0
+    for spec_path in specs:
+        try:
+            status = inspect_submission_cache(spec_path)
+        except Exception as exc:
+            print(f"gc: WARNING: cannot inspect {spec_path}: {exc}", file=sys.stderr)
+            continue
+        known_ids.add(status.submission_id)
+        if status.active:
+            skipped_active += 1
+            continue
+        if not status.cache_paths or not status.terminal:
+            continue
+        age = status.terminal_age_hours or 0.0
+        threshold = args.successful_after_hours if status.state == "successful" else args.failed_after_hours
+        if age >= threshold:
+            candidates.append((spec_path, status))
+
+    mode = "APPLY" if args.apply else "DRY RUN"
+    print(f"gc: {mode}; output={output_dir}; cache={cache_dir}")
+    print(f"gc: scanned {len(specs)} submission(s), skipped {skipped_active} active submission(s)")
+    reclaim = 0
+    for _, status in candidates:
+        _print_cleanup_status(status, prefix="gc: ")
+        reclaim += sum(entry.bytes for entry in status.cache_paths)
+
+    orphan_entries = []
+    if args.orphans_after_hours is not None:
+        orphan_entries = stale_orphan_cache_dirs(
+            cache_dir, known_ids, older_than_hours=args.orphans_after_hours
+        )
+        for entry in orphan_entries:
+            print(f"gc: orphan {entry.label:<20} {_format_bytes(entry.bytes):>10}  {entry.path}")
+            reclaim += entry.bytes
+
+    print(f"gc: reclaimable {_format_bytes(reclaim)}")
+    if not args.apply:
+        print("gc: dry run; pass --apply to delete")
+        return 0
+
+    for spec_path, _ in candidates:
+        cleanup_submission_cache(spec_path, force=False, dry_run=False)
+    remove_cache_paths(orphan_entries)
+    print("gc: cleanup complete; persistent submission metadata, outputs and logs were preserved")
+    return 0
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     path = _find_chain(args.chain)
     state = load_state(path)
@@ -547,7 +674,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = {"init", "config", "submit", "submit-manifest", "status", "submission-status", "cancel"}
+    commands = {"init", "config", "submit", "submit-manifest", "status", "submission-status", "cleanup", "gc", "cancel"}
     top_level = {"-h", "--help", "--version"}
     if argv and argv[0] not in commands and argv[0] not in top_level:
         argv.insert(0, "submit")
@@ -565,6 +692,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(args)
         if args.subcommand == "submission-status":
             return cmd_submission_status(args)
+        if args.subcommand == "cleanup":
+            return cmd_cleanup(args)
+        if args.subcommand == "gc":
+            return cmd_gc(args)
         if args.subcommand == "cancel":
             return cmd_cancel(args)
         parser.error("unknown command")

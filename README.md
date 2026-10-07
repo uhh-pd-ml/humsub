@@ -384,3 +384,18 @@ into law's remote script without resolving virtualenv symlinks.  Application
 containers belong inside the application payload, not around the law remote
 job.  This avoids host/container glibc mismatches and keeps the scheduler layer
 independent of application runtime choices such as Apptainer or `cmsexec`.
+
+## Cache cleanup and garbage collection
+
+Manifest workflows keep frozen staged inputs on the configured SSD cache after submission so failed jobs remain reproducible.  Per-branch `payload-work` scratch is removed after normal success or failure.
+
+Use `humsub cleanup SUBMISSION_ID` to remove the SSD `stages/` and `payload-work/` trees for a terminal submission while preserving BeeGFS submission metadata, outputs, chain state, and logs.  Active submissions are refused unless `--force` is passed.
+
+`humsub gc` is safe by default and only reports what it would remove.  Defaults are successful submissions older than 24 hours and failed submissions older than 168 hours (7 days):
+
+```bash
+humsub gc
+humsub gc --apply
+```
+
+Optional orphan cleanup is explicit, for example `humsub gc --orphans-after-hours 48 --apply`.  This can remove cache directories whose submission metadata no longer exists under the current configured output directory.
