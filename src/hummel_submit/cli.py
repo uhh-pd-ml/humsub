@@ -384,6 +384,20 @@ def _print_manifest_submission(spec: dict[str, Any], output_dir: Path, *, wait: 
         print("[submit] law returned after submission; autonomous chains continue independently")
 
 
+def _all_outputs_exist(manifest: dict[str, Any]) -> bool:
+    return all(Path(output).exists() for branch in manifest["branches"] for output in branch["outputs"])
+
+
+def _discard_preparation(staged_root: Path | None, spec_path: Path | None, spec: dict[str, Any] | None) -> None:
+    """Remove the frozen submission, staged inputs and run directory of a submission that started no chain."""
+    if staged_root is not None:
+        shutil.rmtree(staged_root, ignore_errors=True)
+    if spec_path is not None:
+        shutil.rmtree(spec_path.parent, ignore_errors=True)
+    if spec is not None:
+        shutil.rmtree(Path(spec["run_dir"]), ignore_errors=True)
+
+
 def cmd_submit_manifest(args: argparse.Namespace) -> int:
     project_dir = Path.cwd().resolve()
     config, sources = load_config(project_dir, _cli_overrides(args), require_command=False)
@@ -489,6 +503,11 @@ def cmd_submit_manifest(args: argparse.Namespace) -> int:
         if not success:
             raise ConfigError("law failed to prepare/submit the manifest workflow")
         spec = load_submission_spec(spec_path)
+        if not spec.get("chain_ids") and _all_outputs_exist(manifest):
+            # Idempotent re-submission: law found every branch complete and submitted nothing.
+            _discard_preparation(staged_root, spec_path, spec)
+            print(f"[submit] all {len(manifest['branches'])} branches already have their outputs; nothing to submit")
+            return 0
     except Exception:
         # Once any chain exists, keep the complete frozen submission and staged
         # inputs for diagnosis.  Before that point, clean unused preparation.
@@ -499,12 +518,7 @@ def cmd_submit_manifest(args: argparse.Namespace) -> int:
             except Exception:
                 pass
         if not has_chains:
-            if staged_root is not None:
-                shutil.rmtree(staged_root, ignore_errors=True)
-            if spec_path is not None:
-                shutil.rmtree(spec_path.parent, ignore_errors=True)
-            if spec is not None:
-                shutil.rmtree(Path(spec["run_dir"]), ignore_errors=True)
+            _discard_preparation(staged_root, spec_path, spec)
         raise
 
     _print_manifest_submission(spec, output_dir, wait=args.wait)
