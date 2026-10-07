@@ -7,7 +7,12 @@ import tempfile
 import time
 import unittest
 
-from hummel_submit.cleanup import cleanup_submission_cache, inspect_submission_cache, stale_orphan_cache_dirs
+from hummel_submit.cleanup import (
+    OWNER_MARKER,
+    cleanup_submission_cache,
+    inspect_submission_cache,
+    stale_orphan_cache_dirs,
+)
 
 
 class CleanupTests(unittest.TestCase):
@@ -75,6 +80,26 @@ class CleanupTests(unittest.TestCase):
             os.utime(orphan, (old, old))
             found = stale_orphan_cache_dirs(cache, set(), older_than_hours=48)
             self.assertEqual([entry.path for entry in found], [orphan])
+
+    def test_other_projects_live_staging_is_not_an_orphan(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "cache"
+            old = time.time() - 30 * 3600
+            theirs = cache / "stages" / "other-project-submission"
+            theirs.mkdir(parents=True)
+            owner_spec = Path(td) / "other-output" / "submission.json"
+            owner_spec.parent.mkdir()
+            owner_spec.write_text("{}", encoding="utf-8")
+            (theirs / OWNER_MARKER).write_text(str(owner_spec) + "\n", encoding="utf-8")
+            work = cache / "payload-work" / "other-project-submission"
+            work.mkdir(parents=True)
+            gone = cache / "stages" / "deleted-submission"
+            gone.mkdir()
+            (gone / OWNER_MARKER).write_text(str(Path(td) / "missing.json") + "\n", encoding="utf-8")
+            for path in (theirs, work, gone):
+                os.utime(path, (old, old))
+            found = stale_orphan_cache_dirs(cache, set(), older_than_hours=1)
+            self.assertEqual([entry.path for entry in found], [gone])
 
 
 if __name__ == "__main__":

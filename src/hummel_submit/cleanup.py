@@ -12,6 +12,12 @@ from .state import chain_root
 from .submission import load_submission_spec, submission_root
 
 
+# Written into cache_dir/stages/<submission-id>/ at submission: the path of that
+# submission's submission.json.  Lets gc recognise live submissions of other projects
+# that share the same cache_dir.
+OWNER_MARKER = ".humsub-owner"
+
+
 @dataclass(frozen=True)
 class CachePath:
     label: str
@@ -133,6 +139,15 @@ def iter_submission_specs(output_dir: Path) -> Iterable[Path]:
     return sorted(root.glob("*/submission.json"))
 
 
+def _owned_elsewhere(cache_dir: Path, submission_id: str) -> bool:
+    """True if the submission's staging records an owner whose submission.json still exists."""
+    try:
+        owner = Path((cache_dir / "stages" / submission_id / OWNER_MARKER).read_text(encoding="utf-8").strip())
+    except OSError:
+        return False
+    return owner.is_file()
+
+
 def stale_orphan_cache_dirs(
     cache_dir: Path,
     known_submission_ids: set[str],
@@ -147,7 +162,7 @@ def stale_orphan_cache_dirs(
         if not root.exists():
             continue
         for path in sorted(root.iterdir()):
-            if path.name in known_submission_ids:
+            if path.name in known_submission_ids or _owned_elsewhere(cache_dir, path.name):
                 continue
             try:
                 age_hours = (current - path.stat().st_mtime) / 3600.0

@@ -15,6 +15,7 @@ from .cleanup import (
     inspect_submission_cache,
     iter_submission_specs,
     remove_cache_paths,
+    OWNER_MARKER,
     stale_orphan_cache_dirs,
 )
 from .config import (
@@ -456,6 +457,10 @@ def cmd_submit_manifest(args: argparse.Namespace) -> int:
             submission_id=spec["submission_id"],
             excludes=stage_excludes,
         )
+        # gc only knows the submissions of the *current* project's output_dir, but
+        # cache_dir is shared by default; record the owner so gc never treats the
+        # staging of another project's submission as an orphan.
+        (staged_root / OWNER_MARKER).write_text(str(spec_path) + "\n", encoding="utf-8")
         spec = freeze_manifest_workflow(
             spec_path,
             manifest_source=manifest_source,
