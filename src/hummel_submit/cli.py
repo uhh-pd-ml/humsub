@@ -266,7 +266,7 @@ def _run_law_submission(spec_path: Path) -> None:
         from .law_payload import PayloadWorkflow
     except ImportError as exc:
         raise ConfigError(
-            "law release_prep is required for submission; reinstall hummel-submit with its dependencies"
+            "law (master) is required for submission; reinstall hummel-submit with its dependencies"
         ) from exc
 
     task = PayloadWorkflow(
@@ -294,7 +294,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     print(f"[submit] account     {config['slurm']['account']}")
     print(f"[submit] reservation {config['slurm']['reservation'] or 'none (may still be pulled in magnetically)'}")
     print(f"[submit] time limit  {config['slurm']['time_limit']} per hop")
-    print("[submit] middleware  law release_prep / Hummel chain backend")
+    print("[submit] middleware  law (master) / Hummel chain backend")
     print(f"[submit] config      {', '.join(map(str, sources)) if sources else 'built-in defaults only'}")
 
     if args.dry_run:
@@ -487,7 +487,7 @@ def cmd_submit_manifest(args: argparse.Namespace) -> int:
             from .manifest_workflow import ManifestPayloadWorkflow
         except ImportError as exc:
             raise ConfigError(
-                "law release_prep is required for manifest submission; reinstall hummel-submit with its dependencies"
+                "law (master) is required for manifest submission; reinstall hummel-submit with its dependencies"
             ) from exc
 
         task = ManifestPayloadWorkflow(

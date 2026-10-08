@@ -74,6 +74,10 @@ class HummelWorkflow(SlurmWorkflow):
         return SlurmJobFileFactory(**factory_kwargs)
 
     def slurm_job_config(self, config, job_num: int, branches: list[int]):
+        # Newer law passes lists here for grouped (job array) submission.  A
+        # humsub chain is one job, so HummelJobManager never enables grouping.
+        if isinstance(job_num, (list, tuple)):
+            raise RuntimeError("HummelWorkflow does not support grouped (job array) submission")
         # These directives are documentary when the rendered file is executed by
         # a humsub chain rather than submitted directly with sbatch.  Mirroring
         # the effective Hummel config still makes the frozen payload intelligible

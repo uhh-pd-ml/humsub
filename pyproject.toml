@@ -9,7 +9,7 @@ description = "Law-backed Hummel-2 submission frontend with autonomous Slurm job
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "law @ git+https://github.com/riga/law.git@release_prep",
+  "law @ git+https://github.com/riga/law.git@master",
 ]
 authors = [
   {name = "Kasieczka group"},

@@ -38,7 +38,7 @@ Needs Python ≥ 3.11 and `rsync` (present on Hummel).  Install software under `
 
 ```bash
 python3 -m venv "$USW/venvs/hummel-submit"
-"$USW/venvs/hummel-submit/bin/pip" install .          # also installs law (release_prep branch) from GitHub
+"$USW/venvs/hummel-submit/bin/pip" install .          # also installs law (master branch) from GitHub
 mkdir -p "$HOME/.local/bin"
 ln -sf "$USW/venvs/hummel-submit/bin/humsub" "$HOME/.local/bin/humsub"
 humsub --version
