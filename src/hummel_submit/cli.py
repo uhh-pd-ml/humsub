@@ -474,6 +474,7 @@ def cmd_submit_manifest(args: argparse.Namespace) -> int:
         # gc only knows the submissions of the *current* project's output_dir, but
         # cache_dir is shared by default; record the owner so gc never treats the
         # staging of another project's submission as an orphan.
+        staged_root.mkdir(parents=True, exist_ok=True)  # absent when the submission has no --stage
         (staged_root / OWNER_MARKER).write_text(str(spec_path) + "\n", encoding="utf-8")
         spec = freeze_manifest_workflow(
             spec_path,
