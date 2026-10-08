@@ -306,3 +306,17 @@ pip install pytest && PYTHONPATH=src python -m pytest -q        # scheduler-inde
 ```
 
 A real end-to-end test needs Slurm: run `examples/hello/run.sh` on a frontend.
+
+## Tests
+
+```bash
+python -m pytest tests --ignore=tests/e2e     # unit tests, no cluster needed
+tests/e2e/run.sh                              # end-to-end against a real Slurm configured like Hummel-2
+tests/e2e/run.sh -m slow                      # also the slow ones (real time limits, ~1 min)
+```
+
+The end-to-end tests run inside the Docker image from
+[hummel-slurm-ci](https://github.com/uhh-pd-ml/hummel-slurm-ci) (Slurm 24.11 with Hummel's partitions,
+accounts, submit filter and `/sw/batch/init.sh`); they submit real manifests, chains, failures,
+cancellations and a pre-timeout continuation.  Set `WHEELHOUSE=dir` to install from local wheels when the
+container has no network.
