@@ -42,9 +42,11 @@ class Project:
         self.out = root / "out"
         self.cache = cache
         self.dir.mkdir(parents=True)
+        # law polls its jobs every minute by default; luigi reads ./luigi.cfg
+        (self.dir / "luigi.cfg").write_text("[ManifestPayloadWorkflow]\npoll_interval = 3s\n\n[PayloadWorkflow]\npoll_interval = 3s\n")
         self.configure()
 
-    def configure(self, **slurm) -> None:
+    def configure(self, execution: dict | None = None, **slurm) -> None:
         values = {
             "job_name": "e2e",
             "account": os.environ.get("HUMSUB_E2E_ACCOUNT", "testgrp_std"),
@@ -55,7 +57,9 @@ class Project:
             "signal_seconds": 30,
         }
         values.update(slurm)
-        lines = ["[execution]", 'image = "none"', f'output_dir = "{self.out}"', f'cache_dir = "{self.cache}"', "", "[slurm]"]
+        ex = {"image": "none", "output_dir": str(self.out), "cache_dir": str(self.cache)}
+        ex.update(execution or {})
+        lines = ["[execution]"] + [f"{k} = {json.dumps(v)}" for k, v in ex.items()] + ["", "[slurm]"]
         lines += [f"{k} = {json.dumps(v)}" for k, v in values.items()]
         (self.dir / ".hummel-submit.toml").write_text("\n".join(lines) + "\n")
 
@@ -88,6 +92,10 @@ class Project:
             raise AssertionError(f"humsub {' '.join(args)} failed ({proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
         return proc
 
+    def submit_single(self, run: str, *args: str, **kw) -> "Submission":
+        proc = self.humsub("submit", "--run-name", run, "--", *args, **kw)
+        return Submission(self, proc)
+
     def submit(self, manifest: Path, payload: Path, run: str, *extra: str, **kw) -> "Submission":
         proc = self.humsub("submit-manifest", "--manifest", str(manifest), "--payload", str(payload),
                            "--run-name", run, *extra, **kw)
@@ -100,13 +108,21 @@ class Submission:
         text = proc.stdout + proc.stderr
         m = re.search(r"\[submit\] submission\s+(\S+)", text)
         self.id = m.group(1) if m else None
-        self.chains = re.findall(r"\[submit\] chain\s+(\S+)", text)
+        # manifest mode prints "chain  ID", single-command mode "chain id  ID"
+        self.chains = re.findall(r"\[submit\] chain(?: id)?\s+(\S+)", text)
 
     @property
     def text(self) -> str:
         return self.proc.stdout + self.proc.stderr
 
     def chain_states(self) -> dict[str, str]:
+        if self.id is None:        # single-command mode has no submission line: ask per chain
+            states = {}
+            for chain in self.chains:
+                out = self.project.humsub("status", chain, check=True).stdout
+                m = re.search(r"^status:\s+(\S+) \(law: (\w+)\)", out, re.M)
+                states[chain] = m.group(2)
+            return states
         out = self.project.humsub("submission-status", self.id, check=True).stdout
         return {m.group(1): m.group(2) for m in re.finditer(r"^\s+(\S+): (\w+)", out, re.M)}
 

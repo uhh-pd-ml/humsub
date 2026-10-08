@@ -127,7 +127,7 @@ Environment (in addition to what the Hummel batch environment provides; jobs sta
 | `HUMSUB_SCRATCH` | private empty directory for this branch, under `cache_dir` on the SSD; **removed when the branch ends** (success or failure) |
 | `HUMSUB_STAGE_<NAME>` | staged path of `--stage NAME=…` (name upper-cased, non-alphanumerics → `_`) |
 | `HUMSUB_PAYLOAD` | path of the frozen payload |
-| `HUMSUB_ATTEMPT` | law attempt number (1 on the first try, +1 per `--retries`) |
+| `HUMSUB_ATTEMPT` | law's in-job attempt counter (`LAW_JOB_ATTEMPT`); **always 1**, because a `--retries` resubmission is a new job. Keep your own state if a payload must know it is being retried |
 | `HUMSUB_CHAIN_ID`, `HUMSUB_HOP`, `HUMSUB_STATE_PATH` | chain id, hop number (0-based) and state file of the surrounding chain |
 
 Rules:

@@ -7,3 +7,4 @@ dist/
 .env
 *.patch
 .coverage
+.coverage-e2e/
