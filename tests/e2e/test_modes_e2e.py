@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from .conftest import squeue
+from .conftest import squeue, SLOW_SIGNAL_SECONDS, SLOW_TIME_LIMIT
 
 TRAIN = """
     import json, os, sys
@@ -227,7 +227,7 @@ def test_single_command_resumes_from_checkpoint(project):
     """, "train.py")
     project.configure(
         execution=_single_config(project, auto_args=["--resume={CKPT}"], checkpoint_glob="ckpt-*.txt"),
-        time_limit="00:01:00", signal_seconds=30, max_hops=3,
+        time_limit=SLOW_TIME_LIMIT, signal_seconds=SLOW_SIGNAL_SECONDS, max_hops=3,
     )
     sub = project.submit_single("resume")
     follow = project.humsub("follow", sub.chains[0], timeout=300)
@@ -243,7 +243,7 @@ def test_hop_limit_exhausted_marks_chain_failed(project):
     (project.dir / "results").mkdir()
     manifest = project.write_manifest({0: [out]})
     payload = project.write_payload("import time\ntime.sleep(600)\n")
-    project.configure(time_limit="00:01:00", signal_seconds=30, max_hops=2)
+    project.configure(time_limit=SLOW_TIME_LIMIT, signal_seconds=SLOW_SIGNAL_SECONDS, max_hops=2)
     sub = project.submit(manifest, payload, "limit")
     states = sub.wait(timeout=400)
     assert list(states.values()) == ["failed"], states

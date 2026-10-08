@@ -190,6 +190,10 @@ writable_args = []          # single-command mode: option names whose value must
 ```
 
 * In **manifest mode** only `output_dir`, `cache_dir` and `[slurm]` matter; `image`, `command`, `binds` … are ignored.
+* Slurm delivers the pre-timeout signal anywhere from `signal_seconds + 30 s` to `signal_seconds` before the
+  limit (its time-limit check runs on a 30 s tick).  Keep `time_limit - signal_seconds` well above 30 s plus
+  the job's startup time, or the signal can reach a hop that has not started yet and kill it without
+  requesting continuation.
 * `time_limit` must exceed `signal_seconds` whenever continuation is on (`max_hops > 1` and no
   `--no-resubmit`); otherwise the stop signal arrives right after the job starts and every hop is cut
   short.  `humsub` rejects such a configuration.

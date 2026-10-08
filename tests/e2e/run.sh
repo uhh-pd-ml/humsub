@@ -11,6 +11,7 @@
 #   WHEELHOUSE       directory of wheels (law, luigi, pytest, setuptools, wheel and
 #                    their dependencies); installs offline from it instead of from
 #                    the network, e.g. when the container has no working DNS
+#   DOCKER_RUN_FLAGS extra `docker run` flags, e.g. --cpus=2 to mimic a small CI runner
 #   KEEP_CONTAINER=1 leave the container running afterwards (docker exec -u testuser ...)
 #   COVERAGE=1       measure coverage of hummel_submit in *all* processes (law, chain
 #                    hops, payload workers) and run the unit tests in the same container,
@@ -25,7 +26,7 @@ NAME="${CONTAINER_NAME:-humsub-e2e}"
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 mounts=(-v "$REPO:/src:ro")
 [ -n "${WHEELHOUSE:-}" ] && mounts+=(-v "$WHEELHOUSE:/wheelhouse:ro")
-docker run -d --privileged --init --name "$NAME" -h slurmctl "${mounts[@]}" "$IMAGE" >/dev/null
+docker run -d --privileged --init --name "$NAME" -h slurmctl ${DOCKER_RUN_FLAGS:-} "${mounts[@]}" "$IMAGE" >/dev/null
 cleanup() { [ "${KEEP_CONTAINER:-0}" = 1 ] || docker rm -f "$NAME" >/dev/null 2>&1; }
 fetch_coverage() {
     [ "${COVERAGE:-0}" = 1 ] || return 0

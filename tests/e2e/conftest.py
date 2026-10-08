@@ -18,6 +18,15 @@ import uuid
 
 import pytest
 
+# slurmctld checks time limits on a ~30 s tick and sends --signal=B:USR1@N once
+# (limit - now) <= N + 30 s.  The signal therefore arrives between (limit - N - 30 s)
+# and (limit - N) after the job's start -- *early*, not late.  With a 1 min limit and
+# N = 30 it can arrive seconds after the job started, before humsub's handler is
+# installed on a slow runner; the default action then kills the hop without a
+# continuation marker.  A 2 min limit with N = 60 gives 30-60 s after start.
+SLOW_TIME_LIMIT = "00:02:00"
+SLOW_SIGNAL_SECONDS = 60
+
 E2E_ENABLED = os.environ.get("HUMSUB_E2E") == "1" and shutil.which("sbatch") is not None
 
 
@@ -148,6 +157,37 @@ def sacct_states(job_ids: list[str]) -> dict[str, str]:
     return dict(line.split("|", 1) for line in out.splitlines() if "|" in line)
 
 
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    rep = outcome.get_result()
+    setattr(item, "rep_" + rep.when, rep)
+
+
+def _tail(path: Path, lines: int = 40) -> str:
+    try:
+        return "\n".join(path.read_text(errors="replace").splitlines()[-lines:])
+    except OSError as exc:
+        return f"<unreadable: {exc}>"
+
+
+def diagnostics(proj: "Project") -> str:
+    """Everything needed to understand a failed e2e test from the CI log alone."""
+    parts = ["queue:\n" + squeue(),
+             "sacct:\n" + subprocess.run(["sacct", "-X", "-n", "-o", "JobID,JobName,State,ExitCode,Elapsed,Timelimit,Start,End"],
+                                          text=True, capture_output=True).stdout]
+    for state in sorted((proj.out / ".hummel-submit" / "chains").glob("*/state.json")):
+        try:
+            d = json.loads(state.read_text())
+            keep = {k: d.get(k) for k in ("chain_id", "status", "jobs", "exit_code", "error", "current_hop", "current_job_id", "next_job_id")}
+        except (OSError, ValueError):
+            keep = "<unreadable>"
+        parts.append(f"{state}:\n{keep}")
+    for log in sorted((proj.out / "logs").glob("*.log")):
+        parts.append(f"--- {log.name} (tail) ---\n{_tail(log)}")
+    return "\n".join(parts)
+
+
 @pytest.fixture
 def project(request):
     """Fresh project with outputs on $BEEGFS and staging on $SSD, removed afterwards."""
@@ -158,6 +198,9 @@ def project(request):
     cache = ssd / ".hummel-submit" / tag
     proj = Project(root, cache)
     yield proj
+    rep = getattr(request.node, "rep_call", None)
+    if rep is not None and rep.failed:
+        sys.stderr.write(f"\n===== e2e diagnostics for {request.node.name} =====\n{diagnostics(proj)}\n=====\n")
     subprocess.run(["scancel", "-u", os.environ.get("USER", "testuser")], check=False)
     if not request.config.getoption("--keep-e2e", default=False):
         shutil.rmtree(root, ignore_errors=True)

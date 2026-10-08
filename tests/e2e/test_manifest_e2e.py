@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from .conftest import sacct_states, squeue
+from .conftest import sacct_states, squeue, SLOW_SIGNAL_SECONDS, SLOW_TIME_LIMIT
 
 SUM_PAYLOAD = """
     import json, os, sys
@@ -162,7 +162,7 @@ def test_continuation_across_hops(project):
             time.sleep(600)                      # never finishes; the chain stops it before the limit
         Path({str(out)!r}).write_text("done in hop %d" % hop)
     """)
-    project.configure(time_limit="00:01:00", signal_seconds=30, max_hops=3)
+    project.configure(time_limit=SLOW_TIME_LIMIT, signal_seconds=SLOW_SIGNAL_SECONDS, max_hops=3)
     sub = project.submit(manifest, payload, "hops")
     states = sub.wait(timeout=300)
     assert list(states.values()) == ["finished"], states
