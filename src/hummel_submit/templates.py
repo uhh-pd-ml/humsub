@@ -39,10 +39,6 @@ time_limit = "4:00:00"
 signal_seconds = 600
 max_hops = 20
 
-# Default is deliberately conservative: application failures stop the chain.
-# If true, a failure is retried only when a checkpoint exists.
-retry_on_failure = false
-
 # Escape hatch for SLURM options not modeled above, e.g.
 # extra_args = ["--cpus-per-task=8", "--exclude=g002"]
 # Hummel-2 forbids explicit memory requests such as --mem.

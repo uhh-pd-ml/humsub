@@ -32,7 +32,7 @@ class HopTests(unittest.TestCase):
             state_path.write_text(json.dumps(state), encoding="utf-8")
             with patch.dict(os.environ, {"SLURM_JOB_ID": "101"}, clear=False), \
                  patch("hummel_submit.worker.submit") as submit_mock, \
-                 patch("hummel_submit.worker.run_payload") as run_mock:
+                 patch("hummel_submit.worker.run_chain_payload") as run_mock:
                 rc = worker_main([str(state_path), "1"])
             self.assertEqual(rc, 0)
             submit_mock.assert_not_called()

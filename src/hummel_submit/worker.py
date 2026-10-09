@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-from .runner import log, run_payload
+from .chain_runner import log, run_chain_payload
 from .slurm import SlurmError, cancel_jobs, submit
 from .state import append_job, continue_marker, done_marker, load_state, mark_status
 
@@ -13,9 +13,9 @@ def should_queue_follower(hop: int, max_hops: int) -> bool:
     return hop + 1 < max_hops
 
 
-def _mark_done(state_path: Path, reason: str) -> None:
+def _mark_done(state_path: Path, reason: str, **fields: object) -> None:
     done_marker(state_path).write_text(reason + "\n", encoding="utf-8")
-    mark_status(state_path, reason)
+    mark_status(state_path, reason, **fields)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -27,8 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     state_path = Path(argv[0]).resolve()
     hop = int(argv[1])
     state = load_state(state_path)
-    cfg = state["config"]
-    slurm = cfg["slurm"]
+    slurm = state["config"]["slurm"]
     job_id = os.environ.get("SLURM_JOB_ID")
     if not job_id:
         print("humsub worker must run inside a SLURM job", file=sys.stderr)
@@ -40,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
         log("chain is already marked done; exiting")
         return 0
 
-    state = mark_status(state_path, f"running-hop-{hop + 1}")
+    mark_status(state_path, f"running-hop-{hop + 1}", current_job_id=job_id, current_hop=hop)
 
     if hop > 0 and not continue_marker(state_path, hop - 1).exists():
         log("previous hop did not explicitly request continuation; stopping chain")
@@ -54,7 +53,8 @@ def main(argv: list[str] | None = None) -> int:
     if state["resubmit"] and should_queue_follower(hop, max_hops):
         try:
             next_job = submit(state, state_path, hop + 1, dependency=job_id)
-            state = append_job(state_path, next_job)
+            append_job(state_path, next_job)
+            mark_status(state_path, f"running-hop-{hop + 1}", current_job_id=job_id, next_job_id=next_job)
             log(f"queued follower {next_job}; it will run only if this hop explicitly requests continuation")
         except SlurmError as exc:
             log(f"WARNING: could not queue follower: {exc}")
@@ -62,43 +62,43 @@ def main(argv: list[str] | None = None) -> int:
         log(f"reached the configured limit of {max_hops} jobs; no follower queued")
 
     try:
-        rc, timed_out, checkpoint = run_payload(state, state_path, hop)
+        rc, timed_out = run_chain_payload(state, state_path, hop)
     except Exception as exc:
-        log(f"payload setup failed: {exc}")
+        log(f"law payload setup failed: {exc}")
         if next_job:
             cancel_jobs([next_job])
-        _mark_done(state_path, "failed-to-start")
+        _mark_done(state_path, "failed-to-start", error=str(exc), exit_code=2)
         return 2
 
-    state = load_state(state_path)
     if rc == 0 and not timed_out:
-        log("run completed normally; stopping chain")
+        log("law payload completed normally; stopping chain")
         if next_job:
             cancel_jobs([next_job])
-        _mark_done(state_path, "completed")
+        _mark_done(state_path, "completed", exit_code=0)
         return 0
 
     if timed_out:
         if next_job:
-            mark_status(state_path, f"continuing-after-hop-{hop + 1}")
+            mark_status(
+                state_path,
+                f"continuing-after-hop-{hop + 1}",
+                current_job_id=job_id,
+                next_job_id=next_job,
+            )
             log("time slice ended; follower will continue the chain")
-        else:
-            log("time slice ended but no follower is queued; chain stops here")
-            _mark_done(state_path, "stopped-no-follower")
-        # An intentional time-slice handoff is a successful batch job, avoiding
-        # spurious SLURM failure mail for every slice.
-        return 0
+            # Intentional handoff is successful from Slurm's point of view.  To
+            # law, the stable chain id remains RUNNING until a later hop either
+            # completes or fails.
+            return 0
 
-    if slurm["retry_on_failure"] and checkpoint is not None and next_job:
-        continue_marker(state_path, hop).touch()
-        mark_status(state_path, f"retrying-after-hop-{hop + 1}")
-        log(f"payload failed with exit code {rc}, but retry_on_failure=true and checkpoint exists; follower will retry")
-        return rc if 0 <= rc <= 255 else 1
+        log("time slice ended but no follower is queued; chain cannot continue")
+        _mark_done(state_path, "stopped-no-follower", exit_code=1)
+        return 1
 
-    log(f"payload failed with exit code {rc}; stopping chain")
+    log(f"law payload failed with exit code {rc}; stopping chain")
     if next_job:
         cancel_jobs([next_job])
-    _mark_done(state_path, f"failed-{rc}")
+    _mark_done(state_path, f"failed-{rc}", exit_code=rc)
     return rc if 0 <= rc <= 255 else 1
 
 

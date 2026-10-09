@@ -35,7 +35,6 @@ DEFAULTS: dict[str, Any] = {
         "mail": "",
         "reservation": "",
         "max_hops": 20,
-        "retry_on_failure": False,
         "extra_args": [],
     },
     "validation": {
@@ -199,8 +198,6 @@ def validate_config(config: dict[str, Any], *, require_command: bool = True) -> 
     if slurm["max_hops"] < 1:
         raise ConfigError("[slurm].max_hops must be >= 1")
 
-    if not isinstance(slurm["retry_on_failure"], bool):
-        raise ConfigError("[slurm].retry_on_failure must be true or false")
     if not isinstance(slurm["extra_args"], list) or not all(isinstance(x, str) and x for x in slurm["extra_args"]):
         raise ConfigError("[slurm].extra_args must be an array of argument strings")
     if not isinstance(validation["writable_args"], list) or not all(
@@ -208,6 +205,7 @@ def validate_config(config: dict[str, Any], *, require_command: bool = True) -> 
     ):
         raise ConfigError("[validation].writable_args must be an array of option names such as '--output-dir'")
 
+    slurm_time_seconds(slurm["time_limit"])  # syntax check only
     _validate_extra_args(slurm["extra_args"])
 
 
@@ -223,6 +221,49 @@ def _validate_extra_args(args: list[str]) -> None:
             raise ConfigError(
                 f"{option} is managed by humsub; set the corresponding [slurm] option instead"
             )
+
+
+_SLURM_TIME_RE = re.compile(r"^(?:(\d+)-)?(\d+)(?::(\d+))?(?::(\d+))?$")
+
+
+def slurm_time_seconds(value: str) -> int | None:
+    """Seconds of a Slurm ``--time`` value; ``None`` for UNLIMITED/INFINITE.
+
+    Accepted forms: ``M``, ``M:S``, ``H:M:S``, ``D-H``, ``D-H:M``, ``D-H:M:S``.
+    """
+    text = str(value).strip()
+    if text.upper() in {"UNLIMITED", "INFINITE"}:
+        return None
+    match = _SLURM_TIME_RE.fullmatch(text)
+    if not match:
+        raise ConfigError(f"invalid [slurm].time_limit {value!r}; expected e.g. 90, 30:00, 04:00:00 or 1-12:00:00")
+    days, first, second, third = match.groups()
+    if days is not None:  # D-H[:M[:S]]
+        hours, minutes, seconds = int(first), int(second or 0), int(third or 0)
+    elif third is not None:  # H:M:S
+        hours, minutes, seconds = int(first), int(second), int(third)
+    else:  # M or M:S
+        hours, minutes, seconds = 0, int(first), int(second or 0)
+    return ((int(days or 0) * 24 + hours) * 60 + minutes) * 60 + seconds
+
+
+def check_signal_window(config: dict[str, Any], *, resubmit: bool) -> None:
+    """Reject a time limit that the pre-timeout signal would fire inside immediately.
+
+    Continuation asks Slurm for ``--signal=B:USR1@signal_seconds``; with
+    ``time_limit <= signal_seconds`` the signal arrives right after the start, every
+    hop is cut short and the chain ends in ``stopped-no-follower``.
+    """
+    slurm = config["slurm"]
+    if not resubmit or slurm["max_hops"] <= 1:
+        return
+    limit = slurm_time_seconds(slurm["time_limit"])
+    if limit is not None and limit <= slurm["signal_seconds"]:
+        raise ConfigError(
+            f"[slurm].time_limit ({slurm['time_limit']} = {limit} s) must be longer than signal_seconds "
+            f"({slurm['signal_seconds']} s): the pre-timeout signal would fire immediately and every hop would be "
+            "cut short. Raise time_limit, lower signal_seconds, or use --no-resubmit / max_hops = 1."
+        )
 
 
 def validate_run_name(name: str) -> str:

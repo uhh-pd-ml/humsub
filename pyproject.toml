@@ -4,10 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hummel-submit"
-version = "0.2.1"
-description = "Safe, project-configurable SLURM submission helper for Hummel-2"
+version = "0.4.4"
+description = "Law-backed Hummel-2 submission frontend with autonomous Slurm job chains"
 readme = "README.md"
 requires-python = ">=3.11"
+dependencies = [
+  "law @ git+https://github.com/riga/law.git@master",
+]
 authors = [
   {name = "Kasieczka group"},
 ]

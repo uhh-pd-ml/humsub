@@ -5,3 +5,6 @@ build/
 dist/
 .venv/
 .env
+*.patch
+.coverage
+.coverage-e2e/

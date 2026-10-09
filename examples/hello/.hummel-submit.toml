@@ -1,0 +1,14 @@
+# Small CPU job: no container, state on BeeGFS, staging on the SSD.
+[execution]
+image = "none"
+output_dir = "${BEEGFS}/humsub-examples/state"   # run state, chains, logs (shared, persistent)
+cache_dir = "${SSD}/.hummel-submit/cache"        # frozen stages + branch scratch
+
+[slurm]
+job_name = "hello"
+account = "kasieczka_std"      # <- your Slurm account
+partition = "std"
+gpus = 0
+time_limit = "00:10:00"
+max_hops = 2
+signal_seconds = 60          # pre-timeout signal; must be shorter than time_limit

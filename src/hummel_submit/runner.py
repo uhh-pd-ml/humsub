@@ -5,18 +5,11 @@ import os
 from pathlib import Path
 import shutil
 import shlex
-import signal
 import subprocess
-import time
 from typing import Any
 
+from .chain_runner import log
 from .envfile import load_env_file
-
-
-def log(message: str) -> None:
-    job = os.environ.get("SLURM_JOB_ID", "worker")
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{stamp}] [job:{job}] {message}", flush=True)
 
 
 def newest_checkpoint(state: dict[str, Any]) -> Path | None:
@@ -34,10 +27,8 @@ def newest_checkpoint(state: dict[str, Any]) -> Path | None:
 def detect_ngpu() -> int:
     raw = os.environ.get("SLURM_GPUS_ON_NODE", "").strip()
 
-    # Inside SLURM, report the resources allocated to the job rather than
-    # probing physical hardware on the node.  CPU-only jobs may run on hosts
-    # where nvidia-smi exists (or can see a device outside the allocation),
-    # which must not turn into a false positive GPU count.
+    # Inside SLURM, report resources assigned to the allocation and never infer
+    # GPUs merely from visible host hardware.
     if os.environ.get("SLURM_JOB_ID"):
         if raw.isdigit():
             return int(raw)
@@ -47,7 +38,13 @@ def detect_ngpu() -> int:
         return int(raw)
     nvidia = shutil.which("nvidia-smi")
     if nvidia:
-        proc = subprocess.run([nvidia, "-L"], check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc = subprocess.run(
+            [nvidia, "-L"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
         count = sum(1 for line in proc.stdout.splitlines() if line.strip())
         if count:
             return count
@@ -99,7 +96,9 @@ def _runtime_env(state: dict[str, Any], job_id: str) -> tuple[dict[str, str], di
         "PYTHONPATH": state["project_dir"] + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""),
         "HUMMEL_RUN_NAME": state["run_name"],
         "HUMMEL_RUN_DIR": state["run_dir"],
-        "HUMMEL_CHAIN_ID": state["chain_id"],
+        "HUMMEL_CHAIN_ID": os.environ.get("HUMSUB_CHAIN_ID", ""),
+        "HUMSUB_HOP": os.environ.get("HUMSUB_HOP", "0"),
+        "HUMSUB_STATE_PATH": os.environ.get("HUMSUB_STATE_PATH", ""),
     }
     env.update(runtime)
     return env, {**loaded, **runtime}, cache
@@ -125,47 +124,39 @@ def make_process_command(state: dict[str, Any], command: list[str], ngpu: int) -
     return proc_cmd, env, cache
 
 
-def run_payload(state: dict[str, Any], state_path: Path, hop: int) -> tuple[int, bool, Path | None]:
+def run_application(state: dict[str, Any]) -> int:
+    """Run the user payload inside a law branch.
+
+    Scheduler lifetime and checkpoint handoff are deliberately *not* handled
+    here.  The surrounding Hummel chain wrapper owns those mechanics and exports
+    ``HUMSUB_HOP``.  This function only reconstructs the scientific command and
+    executes it in the requested runtime/container.
+    """
+    hop = int(os.environ.get("HUMSUB_HOP", "0"))
     resuming = hop > 0
     command, ckpt, ngpu, strategy = build_command(state, resuming=resuming)
     if ckpt:
         log(f"resuming from {ckpt}")
     elif resuming and state["config"]["execution"]["checkpoint_glob"]:
-        log("WARNING: no checkpoint found in this run directory; starting this hop without one")
+        log("WARNING: no checkpoint found in this run directory; restarting this hop without one")
     log(f"GPUs visible={ngpu}, strategy={strategy}")
     log("running: " + shlex.join(command))
 
     proc_cmd, env, cache = make_process_command(state, command, ngpu)
-    timed_out = False
-    child: subprocess.Popen[str] | None = None
-
-    def on_usr1(signum: int, frame: object) -> None:
-        nonlocal timed_out, child
-        timed_out = True
-        (state_path.parent / f"continue-{hop}").touch()
-        log("time limit approaching: marked chain for continuation and sending SIGTERM to the payload")
-        if child is not None and child.poll() is None:
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-
-    old_handler = signal.signal(signal.SIGUSR1, on_usr1)
     try:
-        child = subprocess.Popen(
+        proc = subprocess.run(
             proc_cmd,
             cwd=state["project_dir"],
             env=env,
             text=True,
-            start_new_session=True,
+            check=False,
         )
-        rc = child.wait()
+        rc = proc.returncode
     finally:
-        signal.signal(signal.SIGUSR1, old_handler)
         try:
             shutil.rmtree(cache)
         except OSError as exc:
             log(f"WARNING: could not remove cache directory {cache}: {exc}")
 
-    log(f"payload finished with exit code {rc} (pre-timeout signal received: {timed_out})")
-    return rc, timed_out, newest_checkpoint(state)
+    log(f"payload finished with exit code {rc}")
+    return rc

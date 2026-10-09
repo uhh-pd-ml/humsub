@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import subprocess
@@ -10,6 +11,29 @@ class SlurmError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class SlurmJobStatus:
+    job_id: str
+    state: str
+    exit_code: int | None = None
+
+    @property
+    def pending(self) -> bool:
+        return self.state in {"CONFIGURING", "PENDING", "REQUEUED", "REQUEUE_HOLD", "REQUEUE_FED"}
+
+    @property
+    def running(self) -> bool:
+        return self.state in {"RUNNING", "COMPLETING", "STAGE_OUT"}
+
+    @property
+    def finished(self) -> bool:
+        return self.state == "COMPLETED" and (self.exit_code in (None, 0))
+
+    @property
+    def failed(self) -> bool:
+        return not (self.pending or self.running or self.finished)
+
+
 def slurm_command(name: str) -> str:
     found = shutil.which(name)
     if found:
@@ -18,10 +42,26 @@ def slurm_command(name: str) -> str:
     return str(fallback)
 
 
+def slurm_log_path(state: dict[str, Any], job_id: str | None = None) -> Path:
+    """Return the Slurm stdout/stderr path for a chain job.
+
+    With *job_id* omitted, the returned path contains Slurm's ``%x`` and ``%j``
+    replacement tokens and is suitable for ``sbatch --output``.  With a job id,
+    return the concrete path that Slurm writes for that job.
+    """
+    output_dir = Path(state["output_dir"])
+    if job_id is None:
+        name = "%x"
+        jid = "%j"
+    else:
+        name = str(state["config"]["slurm"]["job_name"])
+        jid = str(job_id)
+    return output_dir / "logs" / f"{name}_{jid}.log"
+
+
 def base_sbatch_args(state: dict[str, Any]) -> list[str]:
     cfg = state["config"]
     slurm = cfg["slurm"]
-    output_dir = Path(state["output_dir"])
     args = [
         "--parsable",
         f"--job-name={slurm['job_name']}",
@@ -31,7 +71,7 @@ def base_sbatch_args(state: dict[str, Any]) -> list[str]:
         f"--time={slurm['time_limit']}",
         "--export=NONE",
         f"--chdir={state['project_dir']}",
-        f"--output={output_dir / 'logs' / '%x_%j.log'}",
+        f"--output={slurm_log_path(state)}",
     ]
     if slurm["gpus"] > 0:
         args.append(f"--gpus={slurm['gpus']}")
@@ -89,3 +129,87 @@ def queue_status(job_ids: list[str]) -> str:
         stderr=subprocess.DEVNULL,
     )
     return proc.stdout.rstrip()
+
+
+def _parse_exit_code(raw: str) -> int | None:
+    first = raw.split(":", 1)[0].strip()
+    try:
+        return int(first)
+    except ValueError:
+        return None
+
+
+def parse_squeue_status(text: str) -> dict[str, SlurmJobStatus]:
+    result: dict[str, SlurmJobStatus] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|", 1)
+        if len(parts) != 2:
+            continue
+        job_id, state = parts
+        result[job_id.strip()] = SlurmJobStatus(job_id.strip(), state.strip().split()[0])
+    return result
+
+
+def parse_sacct_status(text: str, requested: set[str] | None = None) -> dict[str, SlurmJobStatus]:
+    result: dict[str, SlurmJobStatus] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|")
+        if len(parts) < 3:
+            continue
+        job_id, state, exit_code = (part.strip() for part in parts[:3])
+        # sacct also returns .batch/.extern steps.  The chain tracks top-level
+        # Slurm jobs only, so ignore scheduler steps here.
+        if "." in job_id:
+            continue
+        if requested is not None and job_id not in requested:
+            continue
+        result[job_id] = SlurmJobStatus(job_id, state.split()[0], _parse_exit_code(exit_code))
+    return result
+
+
+def query_jobs(job_ids: list[str]) -> dict[str, SlurmJobStatus]:
+    """Query current and accounting state for top-level Slurm jobs."""
+    if not job_ids:
+        return {}
+
+    requested = set(map(str, job_ids))
+    result: dict[str, SlurmJobStatus] = {}
+
+    squeue = subprocess.run(
+        [slurm_command("squeue"), "-h", "-j", ",".join(job_ids), "-o", "%i|%T"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if squeue.returncode == 0:
+        result.update(parse_squeue_status(squeue.stdout))
+
+    missing = requested - set(result)
+    if missing:
+        sacct = subprocess.run(
+            [
+                slurm_command("sacct"),
+                "-n",
+                "-X",
+                "-P",
+                "-j",
+                ",".join(sorted(missing)),
+                "-o",
+                "JobIDRaw,State,ExitCode",
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        if sacct.returncode == 0:
+            result.update(parse_sacct_status(sacct.stdout, requested=missing))
+
+    return result

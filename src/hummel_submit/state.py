@@ -43,47 +43,61 @@ def load_state(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def create_state(
+def create_chain_state(
     *,
     output_dir: Path,
     project_dir: Path,
     config: dict[str, Any],
     run_name: str,
-    user_args: list[str],
     resubmit: bool,
     python_executable: str,
     package_dir: Path,
+    payload_script: Path,
+    submission_id: str | None = None,
 ) -> tuple[dict[str, Any], Path]:
+    """Create persistent state for one autonomous Hummel chain.
+
+    ``payload_script`` is an already-rendered remote job script.  In the law
+    integration it is produced by law's Slurm job-file factory and intentionally
+    lives in a persistent directory.  The chain wrapper never interprets the
+    scientific payload; it only executes this script repeatedly across Slurm
+    hops until it finishes or the chain stops.
+    """
     chain_id = make_chain_id()
     cdir = chain_dir(output_dir, chain_id)
     cdir.mkdir(parents=True, exist_ok=False)
+
     snapshot_path = cdir / "hummel-submit-worker.zip"
     with zipfile.ZipFile(snapshot_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for source in sorted(package_dir.rglob("*.py")):
             relative = source.relative_to(package_dir)
             archive.write(source, Path("hummel_submit") / relative)
+
     worker = cdir / "worker.sh"
     shutil.copy2(package_dir / "worker.sh", worker)
 
-    run_dir = output_dir / "runs" / run_name
-    run_dir.mkdir(parents=True, exist_ok=False)
+    payload_script = payload_script.resolve()
+    if not payload_script.is_file():
+        raise FileNotFoundError(f"law payload script does not exist: {payload_script}")
+
     (output_dir / "logs").mkdir(parents=True, exist_ok=True)
 
     data: dict[str, Any] = {
-        "schema": 1,
+        "schema": 2,
         "package_version": __version__,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "chain_id": chain_id,
+        "submission_id": submission_id,
         "project_dir": str(project_dir),
         "output_dir": str(output_dir),
         "run_name": run_name,
-        "run_dir": str(run_dir),
         "config": config,
-        "user_args": user_args,
         "resubmit": resubmit,
         "python_executable": python_executable,
         "snapshot_path": str(snapshot_path),
         "worker_script": str(worker),
+        "payload_script": str(payload_script),
+        "payload_cwd": str(payload_script.parent),
         "jobs": [],
         "status": "submitted",
     }
@@ -105,11 +119,10 @@ def _locked_update(path: Path, update: Any) -> dict[str, Any]:
 
 
 def append_job(path: Path, job_id: str) -> dict[str, Any]:
-    """Append a job id without losing a concurrent update from a fast-starting worker."""
+    """Append an inner Slurm job id without losing a concurrent worker update."""
     def update(data: dict[str, Any]) -> None:
         if job_id not in data["jobs"]:
             data["jobs"].append(job_id)
-        data["last_job_id"] = job_id
         if data.get("status") == "submitted":
             data["status"] = "queued"
     return _locked_update(path, update)
