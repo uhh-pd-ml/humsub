@@ -213,9 +213,14 @@ extra_args = []             # e.g. ["--cpus-per-task=8"]; --mem* is forbidden on
 writable_args = []          # single-command mode: option names whose value must be writable
 ```
 
-* **`nice` is on by default** for every chain job: on this cluster other people's jobs are scheduled first, ours fill
-  idle capacity.  `--nice 0` (or `nice = 0`) removes the penalty and is reported at submission.  Note that nice only
-  orders the queue; it does **not** limit how many of your jobs run at once (see `--max-concurrent`).
+* **`nice` is on by default — on purpose.**  The design goal is that productions fill the cluster's idle time (nights, weekends,
+  holidays) *without* impeding interactive and daytime users: every chain job, **including each continuation hop**, is queued
+  below other users' jobs.  Consequently a chain can sit in the queue between two hops for hours, even for days on a busy cluster;
+  that waiting is the intended behaviour, not a malfunction, and the reason why chains carry no wall-time limit of their own.
+  If you need something done *now* (a deadline, a small test), choose it consciously: `--nice 0` (or `nice = 0` in
+  `.hummel-submit.toml`) removes the penalty and is reported at submission; a smaller positive value only lowers your priority a bit.
+  nice only orders the queue; it does **not** limit how many of your jobs run at once (see `--max-concurrent`).
+  `--supervisor-job` is the one exception: the 1-CPU watchdog is never niced.
 * In **manifest mode** only `output_dir`, `cache_dir`, `scratch`, `bulk_scratch_dir`, `fast_bytes_per_job` and `[slurm]` matter; `image`, `command`, `binds` … are ignored.
 * Slurm delivers the pre-timeout signal anywhere from `signal_seconds + 30 s` to `signal_seconds` before the
   limit (its time-limit check runs on a 30 s tick).  Keep `time_limit - signal_seconds` well above 30 s plus

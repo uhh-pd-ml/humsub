@@ -41,8 +41,9 @@ DEFAULTS: dict[str, Any] = {
         "mail": "",
         "reservation": "",
         "max_hops": 20,
-        # Slurm --nice for every chain job.  Positive values lower the priority below other
-        # users' jobs; 0 is an explicit opt-out (--nice 0) and is reported at submission.
+        # Slurm --nice for every chain job, continuation hops included.  Productions are meant to fill idle time
+        # (nights, weekends) without impeding other users, so chains may wait long between hops.  Positive values
+        # lower the priority below other users' jobs; 0 is an explicit opt-out (--nice 0), reported at submission.
         "nice": 1000000,
         # Partition of --supervisor-job (1 CPU); empty = same as `partition`.
         "supervisor_partition": "",

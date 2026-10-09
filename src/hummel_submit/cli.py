@@ -61,8 +61,9 @@ def _add_slurm_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-hops", type=int, help="maximum number of Slurm jobs (hops) in one chain")
     parser.add_argument(
         "--nice", type=int, dest="nice",
-        help="Slurm --nice of the chain jobs (default [slurm].nice = 1000000: other users' jobs go first); "
-             "--nice 0 deliberately disables the penalty",
+        help="Slurm --nice of every chain job incl. continuation hops (default [slurm].nice = 1000000: other users' jobs "
+             "always go first, so chains fill idle time and may wait long between hops - intended). "
+             "--nice 0 deliberately removes the penalty when you need results now",
     )
     parser.add_argument("--sbatch-arg", action="append", default=[], help="extra sbatch option (repeatable), e.g. --sbatch-arg=--cpus-per-task=8")
     parser.add_argument("--skip-path-checks", action="store_true", help="skip Hummel filesystem/path validation (escape hatch)")
