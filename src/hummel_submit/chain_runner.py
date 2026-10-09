@@ -15,6 +15,43 @@ def log(message: str) -> None:
     print(f"[{stamp}] [job:{job}] {message}", flush=True)
 
 
+def hop_timing_env(state: dict[str, Any], now: float | None = None) -> dict[str, str]:
+    """Start time and usable seconds of this hop, for the payload's time-aware retry policy."""
+    from .config import slurm_time_seconds
+    slurm = state["config"]["slurm"]
+    limit = slurm_time_seconds(slurm["time_limit"])
+    if limit is None:
+        return {"HUMSUB_HOP_START": str(time.time() if now is None else now)}
+    signals = state.get("resubmit", True) and slurm.get("max_hops", 2) + state.get("failure_budget", 0) > 1
+    usable = limit - (slurm["signal_seconds"] if signals else 0)
+    return {
+        "HUMSUB_HOP_START": str(time.time() if now is None else now),
+        "HUMSUB_HOP_USABLE_SECONDS": str(max(usable, 0)),
+    }
+
+
+def wait_group_gone(pgid: int, timeout: float = 90.0, poll: float = 0.25) -> bool:
+    """Wait until no process of group *pgid* is left; SIGKILL the group after *timeout* seconds.
+
+    The leader (the law job script) can exit before the processes it started: the law/Python process of
+    a branch needs a moment after SIGTERM to stop its payload and remove the scratch.  The Slurm job must
+    not end before that, or the cleanup is cut short.  Returns False if the group had to be killed.
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        if time.time() > deadline:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            return False
+        time.sleep(poll)
+
+
 def run_chain_payload(
     state: dict[str, Any],
     state_path: Path,
@@ -36,6 +73,7 @@ def run_chain_payload(
         raise FileNotFoundError(f"chain payload working directory is missing: {cwd}")
 
     env = os.environ.copy()
+    env.update(hop_timing_env(state))
     env.update({
         "HUMSUB_CHAIN_ID": state["chain_id"],
         "HUMSUB_HOP": str(hop),
@@ -70,6 +108,8 @@ def run_chain_payload(
             start_new_session=True,
         )
         rc = child.wait()
+        if not wait_group_gone(child.pid):
+            log("processes of the law payload outlived the grace period and were killed")
     finally:
         signal.signal(signal.SIGUSR1, old_handler)
 

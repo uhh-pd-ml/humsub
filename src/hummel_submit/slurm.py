@@ -75,8 +75,10 @@ def base_sbatch_args(state: dict[str, Any]) -> list[str]:
     ]
     if slurm["gpus"] > 0:
         args.append(f"--gpus={slurm['gpus']}")
-    if state.get("resubmit", True) and slurm.get("max_hops", 2) > 1:
+    if state.get("resubmit", True) and slurm.get("max_hops", 2) + state.get("failure_budget", 0) > 1:
         args.append(f"--signal=B:USR1@{slurm['signal_seconds']}")
+    if slurm.get("nice", 0) > 0:
+        args.append(f"--nice={slurm['nice']}")
     if slurm["mail"]:
         args += [f"--mail-user={slurm['mail']}", "--mail-type=FAIL"]
     if slurm["reservation"]:
@@ -89,6 +91,9 @@ def sbatch_command(state: dict[str, Any], state_path: Path, hop: int, dependency
     args = [slurm_command("sbatch"), *base_sbatch_args(state)]
     if dependency:
         args.append(f"--dependency=afterany:{dependency}")
+    elif hop == 0 and state.get("lane_after"):
+        # --max-concurrent: this chain waits for the previous chain of its lane.
+        args.append(f"--dependency=afterany:{state['lane_after']}")
     args += [
         state["worker_script"],
         state["python_executable"],
@@ -213,3 +218,16 @@ def query_jobs(job_ids: list[str]) -> dict[str, SlurmJobStatus]:
             result.update(parse_sacct_status(sacct.stdout, requested=missing))
 
     return result
+
+
+def live_job_ids(user: str | None = None) -> set[str]:
+    """Slurm job ids of *user* (default: the current user) that are pending or running."""
+    import getpass
+    proc = subprocess.run(
+        [slurm_command("squeue"), "-h", "-u", user or getpass.getuser(), "-o", "%i"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    return {line.strip().split("_")[0] for line in proc.stdout.splitlines() if line.strip()}

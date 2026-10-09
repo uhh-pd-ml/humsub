@@ -4,12 +4,23 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
+import signal
 import subprocess
+import threading
+import time
 
 import law
 
 from .contrib.hummel import HummelWorkflow
+from .scratch import (
+    effective_scratch_kind,
+    hop_timing,
+    keep_small_files,
+    remove_scratch,
+    reset_scratch,
+    retry_allowed,
+    scratch_dirs,
+)
 from .submission import load_submission_spec
 
 
@@ -57,57 +68,130 @@ class ManifestPayloadWorkflow(HummelWorkflow, law.LocalWorkflow):
 
         targets = self.output()
         target_list = targets if isinstance(targets, list) else [targets]
-        # A branch is only executed when law considers it incomplete.  Remove any
-        # partial subset left by a previous failed attempt before invoking the
-        # application payload again.
-        for target in target_list:
-            Path(target.path).unlink(missing_ok=True)
+
+        def clear_outputs() -> None:
+            # Only a branch that law considers incomplete runs; remove any partial subset left by
+            # a previous failed attempt before invoking the application payload again.
+            for target in target_list:
+                Path(target.path).unlink(missing_ok=True)
+
+        clear_outputs()
 
         slurm_id = os.environ.get("SLURM_JOB_ID", "local")
-        scratch = (
-            Path(spec["config"]["execution"]["cache_dir"])
-            / "payload-work"
-            / spec["submission_id"]
-            / f"{slurm_id}-{branch_id}"
-        )
-        shutil.rmtree(scratch, ignore_errors=True)
-        scratch.mkdir(parents=True, exist_ok=True)
+        hint = self._manifest().get("humsub") or {}
+        kind = effective_scratch_kind(spec["config"], hint, workflow.get("scratch"))
+        dirs = scratch_dirs(spec["config"], spec["submission_id"], slurm_id, branch_id, kind)
+        reset_scratch(dirs)
+        retries = int(workflow.get("retry_payload", 0))
+        leftovers = Path(spec["run_dir"]) / "leftovers" / f"{slurm_id}-{branch_id}"
 
-        env = os.environ.copy()
-        env.update({
+        base_env = os.environ.copy()
+        base_env.update({
             "HUMSUB_SUBMISSION_ID": spec["submission_id"],
             "HUMSUB_RUN_NAME": spec["run_name"],
             "HUMSUB_RUN_DIR": spec["run_dir"],
             "HUMSUB_BRANCH": str(branch_id),
             "HUMSUB_BRANCH_FILE": str(branch_file),
-            "HUMSUB_SCRATCH": str(scratch),
+            "HUMSUB_SCRATCH": str(dirs.bulk),
+            "HUMSUB_SCRATCH_FAST": str(dirs.fast),
             "HUMSUB_PAYLOAD": str(payload),
             "HUMSUB_ATTEMPT": os.environ.get("LAW_JOB_ATTEMPT", "1"),
         })
         for name, path in workflow.get("stages", {}).items():
-            env[_stage_env_name(name)] = str(path)
+            base_env[_stage_env_name(name)] = str(path)
+
+        interrupted = threading.Event()
+        child: list[subprocess.Popen | None] = [None]
+
+        def on_term(signum: int, frame: object) -> None:
+            # The chain worker sends SIGTERM shortly before the time limit.  Pass it on to the
+            # payload (which runs in its own session), give it a moment, and let ``finally`` below
+            # remove the scratch: a killed worker would otherwise leave hundreds of MB behind.
+            interrupted.set()
+            proc = child[0]
+            if proc is not None and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+        previous = None
+        try:
+            previous = signal.signal(signal.SIGTERM, on_term)
+        except ValueError:  # not the main thread (e.g. unit tests): no handler
+            previous = None
 
         print(f"[humsub] branch={branch_id} context={branch_file}", flush=True)
         print(f"[humsub] payload={payload}", flush=True)
-        try:
-            proc = subprocess.run(
-                [str(payload), str(branch_file)],
-                cwd=spec["project_dir"],
-                env=env,
-                check=False,
-            )
-            if proc.returncode != 0:
-                raise RuntimeError(f"payload failed with exit code {proc.returncode}")
+        print(f"[humsub] scratch={dirs.bulk} fast={dirs.fast} retry_payload={retries}", flush=True)
 
-            missing = [Path(target.path) for target in target_list if not Path(target.path).exists()]
-            if missing:
-                raise RuntimeError(
-                    "payload returned success but did not materialize declared output(s): "
-                    + ", ".join(map(str, missing))
+        durations: list[float] = []
+        failed = 0
+        try:
+            while True:
+                env = dict(base_env, HUMSUB_PAYLOAD_ATTEMPT=str(failed + 1))
+                started = time.time()
+                proc = subprocess.Popen(
+                    [str(payload), str(branch_file)],
+                    cwd=spec["project_dir"],
+                    env=env,
+                    start_new_session=True,
                 )
-        except Exception:
-            for target in target_list:
-                Path(target.path).unlink(missing_ok=True)
+                child[0] = proc
+                if interrupted.is_set():  # signal arrived between spawn and registration
+                    on_term(signal.SIGTERM, None)
+                rc = _wait_with_grace(proc, interrupted)
+                child[0] = None
+                durations.append(time.time() - started)
+                if interrupted.is_set():
+                    raise RuntimeError("branch interrupted by the pre-timeout signal; scratch removed, the next hop re-runs it")
+                missing = [] if rc != 0 else [Path(t.path) for t in target_list if not Path(t.path).exists()]
+                if rc == 0 and not missing:
+                    return
+                failed += 1
+                reason = (
+                    f"payload failed with exit code {rc}" if rc != 0
+                    else "payload returned success but did not materialize declared output(s): " + ", ".join(map(str, missing))
+                )
+                elapsed, usable = hop_timing()
+                allowed, why = retry_allowed(
+                    failed_attempts=failed,
+                    max_retries=retries,
+                    elapsed=elapsed,
+                    usable=usable,
+                    attempt_durations=durations,
+                )
+                print(f"[humsub] attempt {failed} failed: {reason}; {why}", flush=True)
+                if not allowed:
+                    raise RuntimeError(reason)
+                clear_outputs()
+                reset_scratch(dirs)
+        except BaseException:
+            clear_outputs()
+            kept = keep_small_files(dirs, leftovers)
+            if kept:
+                print(f"[humsub] kept {len(kept)} small file(s) of the failed branch in {leftovers}", flush=True)
             raise
         finally:
-            shutil.rmtree(scratch, ignore_errors=True)
+            remove_scratch(dirs)
+            if previous is not None:
+                signal.signal(signal.SIGTERM, previous)
+
+
+def _wait_with_grace(proc: subprocess.Popen, interrupted: threading.Event, grace: float = 45.0) -> int:
+    """Wait for the payload; after an interruption allow *grace* seconds, then SIGKILL its group."""
+    deadline: float | None = None
+    while True:
+        try:
+            return proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        if interrupted.is_set():
+            if deadline is None:
+                deadline = time.time() + grace
+            elif time.time() > deadline:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                return proc.wait()

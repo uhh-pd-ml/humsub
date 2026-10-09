@@ -31,7 +31,21 @@ from .pathcheck import PathCheckError, check_compute_writable, check_payload_arg
 from .slurm import SlurmError, queue_status, sbatch_command, slurm_log_path
 from .state import chain_root, default_run_name, load_state
 from .submission import create_submission_spec, load_submission_spec, submission_root
-from .manifest import freeze_manifest_workflow, load_manifest
+from .manifest import load_manifest
+from .manifest_submit import (
+    SubmitOptions,
+    all_outputs_exist as _all_outputs_exist,
+    discard_preparation as _discard_preparation,
+    print_manifest_submission as _print_manifest_submission,
+    submit_manifest_run,
+)
+from .lineage import (
+    compute_overview,
+    find_submission,
+    format_overview,
+    resume as resume_lineage,
+    sweep_stale_scratch,
+)
 from .staging import parse_stage_exclude, parse_stage_spec, stage_inputs
 from .templates import PROJECT_TEMPLATE, USER_TEMPLATE
 
@@ -45,8 +59,68 @@ def _add_slurm_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reservation", help="Slurm reservation")
     parser.add_argument("--mail", help="e-mail address for failure notifications")
     parser.add_argument("--max-hops", type=int, help="maximum number of Slurm jobs (hops) in one chain")
+    parser.add_argument(
+        "--nice", type=int, dest="nice",
+        help="Slurm --nice of the chain jobs (default [slurm].nice = 1000000: other users' jobs go first); "
+             "--nice 0 deliberately disables the penalty",
+    )
     parser.add_argument("--sbatch-arg", action="append", default=[], help="extra sbatch option (repeatable), e.g. --sbatch-arg=--cpus-per-task=8")
     parser.add_argument("--skip-path-checks", action="store_true", help="skip Hummel filesystem/path validation (escape hatch)")
+
+
+def _add_manifest_policy_options(parser: argparse.ArgumentParser) -> None:
+    """Retry, concurrency, scratch and supervision policy of a manifest submission (also used by resume)."""
+    parser.add_argument(
+        "--retry-payload", type=int, default=None, metavar="N",
+        help="re-run a failing payload up to N times inside the job; a retry is skipped when it cannot finish "
+             "in the time left of the hop",
+    )
+    parser.add_argument(
+        "--safety-margin", type=float, default=None, metavar="F",
+        help="queue retry hops for failed chains: max(1, ceil(F x tasks-per-job)) extra hops per chain, "
+             "no controller needed; mutually exclusive with --retry-payload and --retries",
+    )
+    parser.add_argument(
+        "--max-concurrent", type=int, default=None, metavar="N",
+        help="at most N chains in flight (round-robin lanes enforced by Slurm dependencies, no controller needed)",
+    )
+    parser.add_argument(
+        "--scratch", choices=["beegfs", "ssd"], default=None,
+        help="location of HUMSUB_SCRATCH (bulk per-branch scratch); default [execution].scratch = beegfs",
+    )
+    parser.add_argument("--supervisor-job", action="store_true", default=None,
+                        help="queue a tiny Slurm job that periodically resumes missing branches (no login-node process)")
+    parser.add_argument("--supervisor-interval", type=int, default=None, metavar="SECONDS",
+                        help="seconds between supervisor checks (default 1800)")
+    parser.add_argument("--supervisor-rounds", type=int, default=None, metavar="R",
+                        help="maximum resume rounds of the supervisor (default 3)")
+    parser.add_argument("--ignore-quota-check", action="store_true", default=None,
+                        help="skip the preflight estimate of the SSD footprint")
+
+
+def _option_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    mapping = {
+        "retry_payload": "retry_payload",
+        "safety_margin": "safety_margin",
+        "max_concurrent": "max_concurrent",
+        "scratch": "scratch",
+        "supervisor_job": "supervisor_job",
+        "supervisor_interval": "supervisor_interval",
+        "supervisor_rounds": "supervisor_max_rounds",
+        "ignore_quota_check": "ignore_quota_check",
+        "tasks_per_job": "tasks_per_job",
+        "wait": "wait",
+        "retries": "retries",
+        "parallel_jobs": "parallel_jobs",
+    }
+    out: dict[str, Any] = {}
+    for attr, key in mapping.items():
+        value = getattr(args, attr, None)
+        if value is not None and value is not False:
+            out[key] = value
+    if getattr(args, "no_resubmit", False):
+        out["resubmit"] = False
+    return out
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -99,6 +173,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     manifest.add_argument("--dry-run", action="store_true", help="validate the manifest, stages and paths; submit nothing")
     _add_slurm_options(manifest)
+    _add_manifest_policy_options(manifest)
 
     sub.add_parser("help", help="show this help message")
 
@@ -109,6 +184,23 @@ def _parser() -> argparse.ArgumentParser:
     follow.add_argument("chain", help="chain id (or any of its Slurm job ids)")
     follow.add_argument("-n", "--lines", type=int, default=10, help="initial lines to show from the current log (default: 10)")
     follow.add_argument("--poll-interval", type=float, default=1.0, help=argparse.SUPPRESS)
+
+    resume = sub.add_parser(
+        "resume",
+        help="re-submit only the branches of a submission (or its resumes) whose outputs are still missing",
+    )
+    resume.add_argument("submission", help="submission id or run name of any submission of the lineage")
+    resume.add_argument("--dry-run", action="store_true", help="show what would be resubmitted; submit and delete nothing")
+    resume.add_argument("--include-active", action="store_true",
+                        help="also resubmit branches owned by chains that are still pending/running (normally skipped)")
+    resume.add_argument("--stage", action="append", default=[], metavar="NAME=PATH",
+                        help="override a stage source (e.g. a renewed proxy); stages are re-copied from their sources anyway")
+    resume.add_argument("--wait", action="store_true", default=None, help="keep law alive to poll and retry")
+    resume.add_argument("--retries", type=int, default=None, help="law retries (requires --wait)")
+    resume.add_argument("--tasks-per-job", type=int, default=None, help="branches per chain for the resubmission")
+    resume.add_argument("--parallel-jobs", type=int, default=None, help="rolling submission width (needs --wait)")
+    _add_slurm_options(resume)
+    _add_manifest_policy_options(resume)
 
     submission_status = sub.add_parser(
         "submission-status", help="summarize all autonomous chains belonging to one submission"
@@ -125,6 +217,8 @@ def _parser() -> argparse.ArgumentParser:
 
     gc = sub.add_parser("gc", help="garbage-collect old SSD submission caches")
     gc.add_argument("--apply", action="store_true", help="actually delete; without this flag gc is a dry run")
+    gc.add_argument("--stale-scratch", action="store_true",
+                    help="also remove branch scratch (SSD and bulk) of Slurm jobs that no longer exist")
     gc.add_argument("--successful-after-hours", type=float, default=24.0)
     gc.add_argument("--failed-after-hours", type=float, default=168.0)
     gc.add_argument(
@@ -159,7 +253,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def _cli_overrides(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
     slurm: dict[str, Any] = {}
-    for attr in ("account", "partition", "reservation", "mail", "max_hops"):
+    for attr in ("account", "partition", "reservation", "mail", "max_hops", "nice"):
         value = getattr(args, attr, None)
         if value is not None:
             slurm[attr] = value
@@ -167,7 +261,10 @@ def _cli_overrides(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
         slurm["time_limit"] = args.time_limit
     if getattr(args, "sbatch_arg", None):
         slurm["extra_args"] = args.sbatch_arg
-    return {"slurm": slurm} if slurm else {}
+    out: dict[str, dict[str, Any]] = {"slurm": slurm} if slurm else {}
+    if getattr(args, "scratch", None):
+        out["execution"] = {"scratch": args.scratch}
+    return out
 
 
 def _print_config(config: dict[str, Any], sources: list[Path]) -> None:
@@ -370,159 +467,49 @@ def _stage_exclude_map(values: list[str], stages: dict[str, Path]) -> dict[str, 
     return result
 
 
-def _print_manifest_submission(spec: dict[str, Any], output_dir: Path, *, wait: bool) -> None:
-    print(f"[submit] submission  {spec['submission_id']}")
-    print(f"[submit] run         {spec['run_name']}")
-    print(f"[submit] run dir     {spec['run_dir']}")
-    chain_ids = list(spec.get("chain_ids", []))
-    if not chain_ids:
-        raise ConfigError("law returned successfully but the Hummel backend recorded no chain id")
-    for chain_id in chain_ids:
-        print(f"[submit] chain       {chain_id}")
-        print(f"[submit] state       {chain_root(output_dir) / chain_id / 'state.json'}")
-    if not wait:
-        print("[submit] law returned after submission; autonomous chains continue independently")
-
-
-def _all_outputs_exist(manifest: dict[str, Any]) -> bool:
-    return all(Path(output).exists() for branch in manifest["branches"] for output in branch["outputs"])
-
-
-def _discard_preparation(staged_root: Path | None, spec_path: Path | None, spec: dict[str, Any] | None) -> None:
-    """Remove the frozen submission, staged inputs and run directory of a submission that started no chain."""
-    if staged_root is not None:
-        shutil.rmtree(staged_root, ignore_errors=True)
-    if spec_path is not None:
-        shutil.rmtree(spec_path.parent, ignore_errors=True)
-    if spec is not None:
-        shutil.rmtree(Path(spec["run_dir"]), ignore_errors=True)
-
-
 def cmd_submit_manifest(args: argparse.Namespace) -> int:
     project_dir = Path.cwd().resolve()
     config, sources = load_config(project_dir, _cli_overrides(args), require_command=False)
-    check_signal_window(config, resubmit=not args.no_resubmit)
-    output_dir = Path(config["execution"]["output_dir"])
-    cache_dir = Path(config["execution"]["cache_dir"])
     run_name = default_run_name() if args.run_name is None else validate_run_name(args.run_name)
-
     manifest_source = args.manifest.expanduser().absolute()
     payload_source = args.payload.expanduser().absolute()
     if not manifest_source.is_file():
         raise ConfigError(f"manifest does not exist: {manifest_source}")
     if not payload_source.is_file():
         raise ConfigError(f"payload does not exist: {payload_source}")
-    manifest = load_manifest(manifest_source)
     stages = _stage_map(args.stage)
     stage_excludes = _stage_exclude_map(args.stage_exclude, stages)
+    opts = SubmitOptions.from_dict(_option_overrides(args))
+    submit_manifest_run(
+        project_dir=project_dir,
+        config=config,
+        sources=sources,
+        run_name=run_name,
+        manifest_source=manifest_source,
+        payload_source=payload_source,
+        stages=stages,
+        stage_excludes=stage_excludes,
+        opts=opts,
+        skip_path_checks=args.skip_path_checks,
+        dry_run=args.dry_run,
+    )
+    return 0
 
-    if args.retries < 0 or args.tasks_per_job < 1 or args.parallel_jobs < 0:
-        raise ConfigError("retries and parallel_jobs must be >= 0 and tasks_per_job must be >= 1")
-    if not args.wait and args.retries:
-        raise ConfigError("--retries requires --wait; non-polling law cannot perform controller-side retries")
-    if not args.wait and args.parallel_jobs and len(manifest["branches"]) > args.parallel_jobs:
-        raise ConfigError(
-            "manifest contains more branches than --parallel-jobs, but --wait was not set; "
-            "use --wait for rolling submission or --parallel-jobs=0 to submit all branches immediately"
-        )
 
-    if not args.skip_path_checks:
-        check_compute_writable(output_dir, "execution.output_dir", must_be_shared=True)
-        check_compute_writable(cache_dir, "execution.cache_dir")
-        for branch in manifest["branches"]:
-            for output in branch["outputs"]:
-                check_compute_writable(Path(output), f"branch {branch['id']} output", must_be_shared=True)
-    else:
-        print("[submit] WARNING: filesystem/path validation disabled by --skip-path-checks", file=sys.stderr)
-
-    print(f"[submit] manifest    {manifest_source}")
-    print(f"[submit] payload     {payload_source}")
-    print(f"[submit] branches    {len(manifest['branches'])}")
-    print(f"[submit] run         {run_name}")
-    print(f"[submit] output      {output_dir}")
-    for name, path in stages.items():
-        print(f"[submit] stage       {name}={path}")
-        for pattern in stage_excludes.get(name, []):
-            print(f"[submit] exclude     {name}={pattern}")
-    if sources:
-        print(f"[submit] config      {', '.join(map(str, sources))}")
-
-    if args.dry_run:
-        return 0
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    spec: dict[str, Any] | None = None
-    spec_path: Path | None = None
-    staged_root: Path | None = None
-    try:
-        spec, spec_path = create_submission_spec(
-            output_dir=output_dir,
-            project_dir=project_dir,
-            config=config,
-            run_name=run_name,
-            user_args=[],
-            resubmit=not args.no_resubmit,
-            python_executable=sys.executable,
-        )
-        staged_root = cache_dir / "stages" / spec["submission_id"]
-        frozen_stages = stage_inputs(
-            stages,
-            cache_dir=cache_dir,
-            submission_id=spec["submission_id"],
-            excludes=stage_excludes,
-        )
-        # gc only knows the submissions of the *current* project's output_dir, but
-        # cache_dir is shared by default; record the owner so gc never treats the
-        # staging of another project's submission as an orphan.
-        staged_root.mkdir(parents=True, exist_ok=True)  # absent when the submission has no --stage
-        (staged_root / OWNER_MARKER).write_text(str(spec_path) + "\n", encoding="utf-8")
-        spec = freeze_manifest_workflow(
-            spec_path,
-            manifest_source=manifest_source,
-            payload_source=payload_source,
-            stages=frozen_stages,
-        )
-
-        try:
-            import luigi
-            from .manifest_workflow import ManifestPayloadWorkflow
-        except ImportError as exc:
-            raise ConfigError(
-                "law (master) is required for manifest submission; reinstall hummel-submit with its dependencies"
-            ) from exc
-
-        task = ManifestPayloadWorkflow(
-            humsub_spec=str(spec_path),
-            workflow="slurm",
-            no_poll=not args.wait,
-            retries=args.retries,
-            tasks_per_job=args.tasks_per_job,
-            parallel_jobs=args.parallel_jobs,
-            job_workers=1,
-        )
-        success = luigi.build([task], local_scheduler=True, workers=1)
-        if not success:
-            raise ConfigError("law failed to prepare/submit the manifest workflow")
-        spec = load_submission_spec(spec_path)
-        if not spec.get("chain_ids") and _all_outputs_exist(manifest):
-            # Idempotent re-submission: law found every branch complete and submitted nothing.
-            _discard_preparation(staged_root, spec_path, spec)
-            print(f"[submit] all {len(manifest['branches'])} branches already have their outputs; nothing to submit")
-            return 0
-    except Exception:
-        # Once any chain exists, keep the complete frozen submission and staged
-        # inputs for diagnosis.  Before that point, clean unused preparation.
-        has_chains = False
-        if spec_path and spec_path.exists():
-            try:
-                has_chains = bool(load_submission_spec(spec_path).get("chain_ids"))
-            except Exception:
-                pass
-        if not has_chains:
-            _discard_preparation(staged_root, spec_path, spec)
-        raise
-
-    _print_manifest_submission(spec, output_dir, wait=args.wait)
+def cmd_resume(args: argparse.Namespace) -> int:
+    config, _ = load_config(Path.cwd(), require_command=False)
+    output_dir = Path(config["execution"]["output_dir"])
+    spec_path = find_submission(output_dir, args.submission)
+    stage_overrides = _stage_map(args.stage) if args.stage else None
+    resume_lineage(
+        output_dir,
+        spec_path,
+        config_overrides=_cli_overrides(args),
+        option_overrides=_option_overrides(args),
+        stage_overrides=stage_overrides,
+        dry_run=args.dry_run,
+        include_active=args.include_active,
+    )
     return 0
 
 
@@ -541,6 +528,9 @@ def cmd_submission_status(args: argparse.Namespace) -> int:
         state_path = chain_root(output_dir) / chain_id / "state.json"
         state = load_state(state_path)
         print(f"  {chain_id}: {effective.state} ({state['status']})")
+    print()
+    for line in format_overview(compute_overview(output_dir, spec)):
+        print(line)
     return 0
 
 
@@ -703,6 +693,14 @@ def cmd_gc(args: argparse.Namespace) -> int:
             print(f"gc: orphan {entry.label:<20} {_format_bytes(entry.bytes):>10}  {entry.path}")
             reclaim += entry.bytes
 
+    if args.stale_scratch:
+        count, nbytes = sweep_stale_scratch(config, None, apply=args.apply)
+        print(f"gc: stale scratch of dead jobs: {count} dir(s), {_format_bytes(nbytes)}")
+        if args.apply:
+            reclaim += 0
+        else:
+            reclaim += nbytes
+
     print(f"gc: reclaimable {_format_bytes(reclaim)}")
     if not args.apply:
         print("gc: dry run; pass --apply to delete")
@@ -726,7 +724,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = {"help", "init", "config", "submit", "submit-manifest", "status", "follow", "submission-status", "cleanup", "gc", "cancel"}
+    commands = {"help", "init", "config", "submit", "submit-manifest", "resume", "status", "follow", "submission-status", "cleanup", "gc", "cancel"}
     top_level = {"-h", "--help", "--version"}
     if argv and argv[0] not in commands and argv[0] not in top_level:
         argv.insert(0, "submit")
@@ -742,6 +740,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_submit(args)
         if args.subcommand == "submit-manifest":
             return cmd_submit_manifest(args)
+        if args.subcommand == "resume":
+            return cmd_resume(args)
         if args.subcommand == "status":
             return cmd_status(args)
         if args.subcommand == "follow":

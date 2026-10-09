@@ -73,6 +73,7 @@ def _cache_paths(spec: dict) -> tuple[CachePath, ...]:
     candidates = (
         ("stages", cache_dir / "stages" / submission_id),
         ("payload-work", cache_dir / "payload-work" / submission_id),
+        ("bulk-scratch", Path(spec["config"]["execution"].get("bulk_scratch_dir", cache_dir / "bulk-scratch")) / submission_id),
     )
     return tuple(CachePath(label, path, _dir_size(path)) for label, path in candidates if path.exists())
 

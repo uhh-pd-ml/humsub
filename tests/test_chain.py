@@ -54,3 +54,23 @@ class ChainStatusTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_lane_dependency_follows_the_chain_n_back(tmp_path):
+    import json
+    from hummel_submit.chain import lane_dependency
+    from hummel_submit.state import state_path
+
+    out = tmp_path / "out"
+    for chain_id, jobs in (("c0", ["10"]), ("c1", ["11"]), ("c2", ["12", "20"])):
+        path = state_path(out, chain_id)
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"jobs": jobs}))
+    spec = {"output_dir": str(out), "max_concurrent": 2, "chain_ids": ["c0", "c1"]}
+    assert lane_dependency(spec) == "10"                      # third chain waits for the first
+    spec["chain_ids"] = ["c0", "c1", "c2"]
+    assert lane_dependency(spec) == "11"                      # fourth waits for the second
+    assert lane_dependency({**spec, "chain_ids": ["c0"]}) is None   # fewer chains than lanes
+    assert lane_dependency({**spec, "max_concurrent": 0}) is None   # no cap
+    spec["chain_ids"] = ["c1", "c2"]
+    assert lane_dependency({**spec, "max_concurrent": 1}) == "20"  # most recent job of the previous chain

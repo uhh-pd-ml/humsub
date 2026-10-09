@@ -23,6 +23,12 @@ DEFAULTS: dict[str, Any] = {
         "binds": ["${BEEGFS}", "${USW}", "${SSD}"],
         "nv": True,
         "apptainer": "",
+        # Where HUMSUB_SCRATCH (bulk per-branch scratch) lives: "beegfs" (default, large) or
+        # "ssd" (fast small-file I/O, small quota).  HUMSUB_SCRATCH_FAST is always on the SSD.
+        "scratch": "beegfs",
+        "bulk_scratch_dir": "${BEEGFS}/.hummel-submit/scratch",
+        # Footprint estimates used by the preflight quota check of the SSD.
+        "fast_bytes_per_job": 250_000_000,
     },
     "slurm": {
         "job_name": "job",
@@ -35,12 +41,19 @@ DEFAULTS: dict[str, Any] = {
         "mail": "",
         "reservation": "",
         "max_hops": 20,
+        # Slurm --nice for every chain job.  Positive values lower the priority below other
+        # users' jobs; 0 is an explicit opt-out (--nice 0) and is reported at submission.
+        "nice": 1000000,
+        # Partition of --supervisor-job (1 CPU); empty = same as `partition`.
+        "supervisor_partition": "",
         "extra_args": [],
     },
     "validation": {
         "writable_args": [],
     },
 }
+
+SCRATCH_KINDS = ("beegfs", "ssd")
 
 _ALLOWED = {section: set(values) for section, values in DEFAULTS.items()}
 
@@ -54,6 +67,8 @@ _ENV_OVERRIDES = {
     "HUMMEL_MAIL": ("slurm", "mail", str),
     "HUMMEL_RESERVATION": ("slurm", "reservation", str),
     "HUMMEL_MAX_HOPS": ("slurm", "max_hops", int),
+    "HUMMEL_NICE": ("slurm", "nice", int),
+    "HUMMEL_SCRATCH": ("execution", "scratch", str),
 }
 
 _RESERVED_SBATCH_OPTIONS = {
@@ -70,6 +85,7 @@ _RESERVED_SBATCH_OPTIONS = {
     "--mail-type",
     "--reservation",
     "--dependency", "-d",
+    "--nice",
 }
 
 _FORBIDDEN_MEMORY_OPTIONS = {"--mem", "--mem-per-cpu", "--mem-per-gpu"}
@@ -157,6 +173,7 @@ def load_config(
         exe["image"] = _expand_path(str(exe["image"]), project_dir)
     else:
         exe["image"] = "none"
+    exe["bulk_scratch_dir"] = _expand_path(str(exe["bulk_scratch_dir"]), project_dir)
     exe["env_file"] = _expand_path(str(exe["env_file"]), project_dir)
     exe["binds"] = [_expand_path(str(p), project_dir, relative_to_project=False) for p in exe["binds"]]
     if exe.get("apptainer"):
@@ -186,8 +203,12 @@ def validate_config(config: dict[str, Any], *, require_command: bool = True) -> 
         if gp.is_absolute() or ".." in gp.parts:
             raise ConfigError("[execution].checkpoint_glob must stay inside the run directory (no absolute path or '..')")
 
-    for key in ("nodes", "gpus", "signal_seconds", "max_hops"):
-        if not isinstance(slurm[key], int):
+    if exe["scratch"] not in SCRATCH_KINDS:
+        raise ConfigError(f"[execution].scratch must be one of {', '.join(SCRATCH_KINDS)}")
+    if not isinstance(exe["fast_bytes_per_job"], int) or exe["fast_bytes_per_job"] < 0:
+        raise ConfigError("[execution].fast_bytes_per_job must be a non-negative integer")
+    for key in ("nodes", "gpus", "signal_seconds", "max_hops", "nice"):
+        if not isinstance(slurm[key], int) or isinstance(slurm[key], bool):
             raise ConfigError(f"[slurm].{key} must be an integer")
     if slurm["nodes"] < 1:
         raise ConfigError("[slurm].nodes must be >= 1")
@@ -197,6 +218,8 @@ def validate_config(config: dict[str, Any], *, require_command: bool = True) -> 
         raise ConfigError("[slurm].signal_seconds must be >= 1")
     if slurm["max_hops"] < 1:
         raise ConfigError("[slurm].max_hops must be >= 1")
+    if slurm["nice"] < 0:
+        raise ConfigError("[slurm].nice must be >= 0 (0 disables the priority penalty)")
 
     if not isinstance(slurm["extra_args"], list) or not all(isinstance(x, str) and x for x in slurm["extra_args"]):
         raise ConfigError("[slurm].extra_args must be an array of argument strings")

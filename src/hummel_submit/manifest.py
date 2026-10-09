@@ -24,6 +24,19 @@ def load_manifest(path: Path) -> dict[str, Any]:
     if not isinstance(common, dict):
         raise ManifestError("manifest common field must be an object")
 
+    hint = data.get("humsub", {})
+    if not isinstance(hint, dict):
+        raise ManifestError("manifest humsub field must be an object")
+    unknown = set(hint) - {"scratch", "scratch_bytes_per_branch"}
+    if unknown:
+        raise ManifestError(f"unknown manifest humsub hint(s): {', '.join(sorted(unknown))}")
+    if "scratch" in hint and hint["scratch"] not in ("beegfs", "ssd"):
+        raise ManifestError("manifest humsub.scratch must be 'beegfs' or 'ssd'")
+    if "scratch_bytes_per_branch" in hint and (
+        not isinstance(hint["scratch_bytes_per_branch"], int) or hint["scratch_bytes_per_branch"] < 0
+    ):
+        raise ManifestError("manifest humsub.scratch_bytes_per_branch must be a non-negative integer")
+
     branches = data.get("branches")
     if not isinstance(branches, list) or not branches:
         raise ManifestError("manifest branches must be a non-empty array")
@@ -62,11 +75,14 @@ def load_manifest(path: Path) -> dict[str, Any]:
             "outputs": normalized_outputs,
         })
 
-    return {
+    result = {
         "schema": 1,
         "common": common,
         "branches": sorted(normalized, key=lambda b: b["id"]),
     }
+    if hint:
+        result["humsub"] = hint
+    return result
 
 
 def freeze_manifest_workflow(
@@ -75,6 +91,7 @@ def freeze_manifest_workflow(
     manifest_source: Path,
     payload_source: Path,
     stages: dict[str, str],
+    workflow_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Freeze a generic branch manifest and payload into a submission."""
     spec = load_submission_spec(spec_path)
@@ -123,5 +140,7 @@ def freeze_manifest_workflow(
         "branch_count": len(manifest["branches"]),
         "stages": stages,
     }
+    if workflow_extra:
+        spec["manifest_workflow"].update(workflow_extra)
     atomic_write_json(spec_path, spec)
     return spec
