@@ -43,6 +43,15 @@ def load_state(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def write_worker_snapshot(package_dir: Path, snapshot_path: Path) -> None:
+    """Zip the package so a chain keeps the exact code it was submitted with."""
+    with zipfile.ZipFile(snapshot_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for pattern in ("*.py", "*.sh"):
+            for source in sorted(package_dir.rglob(pattern)):
+                relative = source.relative_to(package_dir)
+                archive.write(source, Path("hummel_submit") / relative)
+
+
 def create_chain_state(
     *,
     output_dir: Path,
@@ -54,6 +63,8 @@ def create_chain_state(
     package_dir: Path,
     payload_script: Path,
     submission_id: str | None = None,
+    failure_budget: int = 0,
+    lane_after: str | None = None,
 ) -> tuple[dict[str, Any], Path]:
     """Create persistent state for one autonomous Hummel chain.
 
@@ -68,10 +79,7 @@ def create_chain_state(
     cdir.mkdir(parents=True, exist_ok=False)
 
     snapshot_path = cdir / "hummel-submit-worker.zip"
-    with zipfile.ZipFile(snapshot_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for source in sorted(package_dir.rglob("*.py")):
-            relative = source.relative_to(package_dir)
-            archive.write(source, Path("hummel_submit") / relative)
+    write_worker_snapshot(package_dir, snapshot_path)
 
     worker = cdir / "worker.sh"
     shutil.copy2(package_dir / "worker.sh", worker)
@@ -100,6 +108,9 @@ def create_chain_state(
         "payload_cwd": str(payload_script.parent),
         "jobs": [],
         "status": "submitted",
+        "failure_budget": failure_budget,
+        "failures_used": 0,
+        "lane_after": lane_after,
     }
     path = cdir / "state.json"
     atomic_write_json(path, data)

@@ -31,4 +31,4 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-hummel_submit = ["worker.sh"]
+hummel_submit = ["worker.sh", "supervisor.sh"]

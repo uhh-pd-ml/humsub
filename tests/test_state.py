@@ -54,3 +54,15 @@ class StateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_snapshot_contains_shell_scripts_and_modules(tmp_path):
+    import zipfile
+    import hummel_submit
+    from hummel_submit.state import write_worker_snapshot
+
+    package_dir = Path(hummel_submit.__file__).parent
+    snapshot = tmp_path / "snap.zip"
+    write_worker_snapshot(package_dir, snapshot)
+    names = set(zipfile.ZipFile(snapshot).namelist())
+    assert {"hummel_submit/worker.py", "hummel_submit/worker.sh", "hummel_submit/supervisor.sh"} <= names

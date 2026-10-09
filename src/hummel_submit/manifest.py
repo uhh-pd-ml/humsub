@@ -24,6 +24,19 @@ def load_manifest(path: Path) -> dict[str, Any]:
     if not isinstance(common, dict):
         raise ManifestError("manifest common field must be an object")
 
+    hint = data.get("humsub", {})
+    if not isinstance(hint, dict):
+        raise ManifestError("manifest humsub field must be an object")
+    unknown = set(hint) - {"scratch", "scratch_bytes_per_branch"}
+    if unknown:
+        raise ManifestError(f"unknown manifest humsub hint(s): {', '.join(sorted(unknown))}")
+    if "scratch" in hint and hint["scratch"] not in ("beegfs", "ssd"):
+        raise ManifestError("manifest humsub.scratch must be 'beegfs' or 'ssd'")
+    if "scratch_bytes_per_branch" in hint and (
+        not isinstance(hint["scratch_bytes_per_branch"], int) or hint["scratch_bytes_per_branch"] < 0
+    ):
+        raise ManifestError("manifest humsub.scratch_bytes_per_branch must be a non-negative integer")
+
     branches = data.get("branches")
     if not isinstance(branches, list) or not branches:
         raise ManifestError("manifest branches must be a non-empty array")
@@ -56,17 +69,37 @@ def load_manifest(path: Path) -> dict[str, Any]:
                 raise ManifestError(f"branch {branch_id} output must be absolute: {output}")
             normalized_outputs.append(str(path_obj))
 
-        normalized.append({
+        extra = branch.get("extra_outputs", [])
+        if not isinstance(extra, list):
+            raise ManifestError(f"branch {branch_id} extra_outputs must be an array")
+        normalized_extra: list[str] = []
+        for output in extra:
+            if not isinstance(output, str) or not output:
+                raise ManifestError(f"branch {branch_id} has an invalid extra output path {output!r}")
+            path_obj = Path(output).expanduser()
+            if not path_obj.is_absolute():
+                raise ManifestError(f"branch {branch_id} extra output must be absolute: {output}")
+            if str(path_obj) in normalized_outputs:
+                raise ManifestError(f"branch {branch_id}: {path_obj} is listed as both output and extra output")
+            normalized_extra.append(str(path_obj))
+
+        entry = {
             "id": branch_id,
             "data": payload_data,
             "outputs": normalized_outputs,
-        })
+        }
+        if normalized_extra:
+            entry["extra_outputs"] = normalized_extra
+        normalized.append(entry)
 
-    return {
+    result = {
         "schema": 1,
         "common": common,
         "branches": sorted(normalized, key=lambda b: b["id"]),
     }
+    if hint:
+        result["humsub"] = hint
+    return result
 
 
 def freeze_manifest_workflow(
@@ -75,6 +108,7 @@ def freeze_manifest_workflow(
     manifest_source: Path,
     payload_source: Path,
     stages: dict[str, str],
+    workflow_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Freeze a generic branch manifest and payload into a submission."""
     spec = load_submission_spec(spec_path)
@@ -108,6 +142,7 @@ def freeze_manifest_workflow(
             "common": manifest["common"],
             "data": branch["data"],
             "outputs": branch["outputs"],
+            "extra_outputs": branch.get("extra_outputs", []),
             "stages": stages,
         }
         branch_path = branch_dir / f"{branch_id:06d}.json"
@@ -123,5 +158,7 @@ def freeze_manifest_workflow(
         "branch_count": len(manifest["branches"]),
         "stages": stages,
     }
+    if workflow_extra:
+        spec["manifest_workflow"].update(workflow_extra)
     atomic_write_json(spec_path, spec)
     return spec
