@@ -154,3 +154,19 @@ def test_sweep_removes_only_dead_jobs(tmp_path: Path) -> None:
 )
 def test_supervisor_decisions(missing, active, round_no, checks, expected) -> None:
     assert decide(missing=missing, active_branches=active, round_no=round_no, max_rounds=3, checks=checks) == expected
+
+
+def test_supervisor_can_use_its_own_account_and_partition(tmp_path: Path) -> None:
+    """GPU chains run under a GPU account that cannot submit a 1-CPU job to the CPU partition."""
+    from hummel_submit.supervisor import supervisor_command
+
+    out, spec_path, spec = _make_lineage(tmp_path)
+    spec["python_executable"] = "/py"
+    spec["config"]["slurm"].update(account="grp_gpu", partition="gpu", supervisor_account="grp_std", supervisor_partition="std")
+    spec_path.write_text(json.dumps(spec))
+    args = supervisor_command(spec_path, 1)
+    assert "--account=grp_std" in args and "--partition=std" in args
+    spec["config"]["slurm"].update(supervisor_account="", supervisor_partition="")
+    spec_path.write_text(json.dumps(spec))
+    args = supervisor_command(spec_path, 1)
+    assert "--account=grp_gpu" in args and "--partition=gpu" in args

@@ -45,7 +45,7 @@ def supervisor_command(spec_path: Path, round_no: int, checks: int = 1) -> list[
         slurm_command("sbatch"),
         "--parsable",
         f"--job-name={slurm['job_name']}-supervisor",
-        f"--account={slurm['account']}",
+        f"--account={slurm.get('supervisor_account') or slurm['account']}",
         f"--partition={slurm.get('supervisor_partition') or slurm['partition']}",
         "--nodes=1",
         "--ntasks=1",

@@ -206,6 +206,7 @@ signal_seconds = 600        # a hop is stopped this long BEFORE time_limit; must
 max_hops = 20               # at most this many Slurm jobs per chain
 nice = 1000000              # Slurm --nice of every chain job: other users' jobs go first; 0 = explicit opt-out
 supervisor_partition = ""   # partition of --supervisor-job (default: same as `partition`)
+supervisor_account = ""     # account of --supervisor-job (default: same as `account`); e.g. a CPU account for GPU chains
 mail = ""   reservation = ""
 extra_args = []             # e.g. ["--cpus-per-task=8"]; --mem* is forbidden on Hummel
 [validation]

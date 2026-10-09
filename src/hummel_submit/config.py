@@ -46,6 +46,9 @@ DEFAULTS: dict[str, Any] = {
         "nice": 1000000,
         # Partition of --supervisor-job (1 CPU); empty = same as `partition`.
         "supervisor_partition": "",
+        # Account of --supervisor-job (default: same as `account`).  Needed when the chains run on a GPU
+        # account/partition that cannot also run a 1-CPU job.
+        "supervisor_account": "",
         "extra_args": [],
     },
     "validation": {
