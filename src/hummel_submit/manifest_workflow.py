@@ -60,6 +60,11 @@ class ManifestPayloadWorkflow(HummelWorkflow, law.LocalWorkflow):
         return targets[0] if len(targets) == 1 else targets
 
     def run(self):
+        soft_file = os.environ.get("HUMSUB_SOFT_STOP_FILE")
+        if soft_file and Path(soft_file).exists():
+            # The hop is past its soft deadline (the previous branch finished inside the grace window): starting this
+            # branch would only get it killed.  The follower hop starts it.
+            raise RuntimeError("soft-stop notice already given: branch not started, the next hop runs it")
         spec = self._spec()
         workflow = self._workflow()
         branch_id = int(self.branch)
@@ -148,6 +153,10 @@ class ManifestPayloadWorkflow(HummelWorkflow, law.LocalWorkflow):
                 missing = [] if rc != 0 else [Path(t.path) for t in target_list if not Path(t.path).exists()]
                 if rc == 0 and not missing:
                     return
+                if rc != 0 and soft_file and Path(soft_file).exists():
+                    # The payload gave up on the soft-stop notice (e.g. checkpointed and exited): that is a hop boundary,
+                    # not a failure, so no retry and no failure accounting; the next hop re-runs the branch.
+                    raise RuntimeError(f"payload stopped after the soft-stop notice (exit {rc}); the next hop re-runs it")
                 failed += 1
                 reason = (
                     f"payload failed with exit code {rc}" if rc != 0

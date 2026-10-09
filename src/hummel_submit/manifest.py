@@ -69,11 +69,28 @@ def load_manifest(path: Path) -> dict[str, Any]:
                 raise ManifestError(f"branch {branch_id} output must be absolute: {output}")
             normalized_outputs.append(str(path_obj))
 
-        normalized.append({
+        extra = branch.get("extra_outputs", [])
+        if not isinstance(extra, list):
+            raise ManifestError(f"branch {branch_id} extra_outputs must be an array")
+        normalized_extra: list[str] = []
+        for output in extra:
+            if not isinstance(output, str) or not output:
+                raise ManifestError(f"branch {branch_id} has an invalid extra output path {output!r}")
+            path_obj = Path(output).expanduser()
+            if not path_obj.is_absolute():
+                raise ManifestError(f"branch {branch_id} extra output must be absolute: {output}")
+            if str(path_obj) in normalized_outputs:
+                raise ManifestError(f"branch {branch_id}: {path_obj} is listed as both output and extra output")
+            normalized_extra.append(str(path_obj))
+
+        entry = {
             "id": branch_id,
             "data": payload_data,
             "outputs": normalized_outputs,
-        })
+        }
+        if normalized_extra:
+            entry["extra_outputs"] = normalized_extra
+        normalized.append(entry)
 
     result = {
         "schema": 1,
@@ -125,6 +142,7 @@ def freeze_manifest_workflow(
             "common": manifest["common"],
             "data": branch["data"],
             "outputs": branch["outputs"],
+            "extra_outputs": branch.get("extra_outputs", []),
             "stages": stages,
         }
         branch_path = branch_dir / f"{branch_id:06d}.json"

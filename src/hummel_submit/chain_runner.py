@@ -5,6 +5,7 @@ from pathlib import Path
 import shlex
 import signal
 import subprocess
+import threading
 import time
 from typing import Any
 
@@ -22,12 +23,18 @@ def hop_timing_env(state: dict[str, Any], now: float | None = None) -> dict[str,
     limit = slurm_time_seconds(slurm["time_limit"])
     if limit is None:
         return {"HUMSUB_HOP_START": str(time.time() if now is None else now)}
+    from .config import effective_grace_seconds
     signals = state.get("resubmit", True) and slurm.get("max_hops", 2) + state.get("failure_budget", 0) > 1
     usable = limit - (slurm["signal_seconds"] if signals else 0)
-    return {
-        "HUMSUB_HOP_START": str(time.time() if now is None else now),
+    start = time.time() if now is None else now
+    env = {
+        "HUMSUB_HOP_START": str(start),
         "HUMSUB_HOP_USABLE_SECONDS": str(max(usable, 0)),
     }
+    if signals:  # expected times (Slurm delivers its signal up to 30 s early): soft notice, then SIGTERM
+        env["HUMSUB_SOFT_STOP_AT"] = str(start + max(usable, 0))
+        env["HUMSUB_HARD_STOP_AT"] = str(start + max(usable, 0) + effective_grace_seconds(slurm))
+    return env
 
 
 def wait_group_gone(pgid: int, timeout: float = 90.0, poll: float = 0.25) -> bool:
@@ -72,9 +79,13 @@ def run_chain_payload(
     if not cwd.is_dir():
         raise FileNotFoundError(f"chain payload working directory is missing: {cwd}")
 
+    from .config import effective_grace_seconds
+    soft_file = state_path.parent / f"soft-stop-{hop}"
+    grace = effective_grace_seconds(state["config"]["slurm"])
     env = os.environ.copy()
     env.update(hop_timing_env(state))
     env.update({
+        "HUMSUB_SOFT_STOP_FILE": str(soft_file),
         "HUMSUB_CHAIN_ID": state["chain_id"],
         "HUMSUB_HOP": str(hop),
         "HUMSUB_STATE_PATH": str(state_path),
@@ -86,17 +97,31 @@ def run_chain_payload(
 
     timed_out = False
     child: subprocess.Popen[str] | None = None
+    timer: threading.Timer | None = None
 
-    def on_usr1(signum: int, frame: object) -> None:
-        nonlocal timed_out
-        timed_out = True
-        (state_path.parent / f"continue-{hop}").touch()
-        log("time limit approaching: marked chain for continuation and sending SIGTERM to the law payload")
+    def hard_stop() -> None:
         if child is not None and child.poll() is None:
+            log("grace period over: sending SIGTERM to the law payload")
             try:
                 os.killpg(child.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+
+    def on_usr1(signum: int, frame: object) -> None:
+        nonlocal timed_out, timer
+        timed_out = True
+        (state_path.parent / f"continue-{hop}").touch()
+        if grace > 0:
+            # Soft stop: only a file appears (no signal: the default action of SIGUSR2 would kill payloads that do not
+            # know it).  Payloads that are nearly done may finish; the next branch of the chain is not started.
+            soft_file.touch()
+            log(f"time limit approaching: soft-stop notice ({soft_file.name}); SIGTERM in {grace} s unless the payload ends first")
+            timer = threading.Timer(grace, hard_stop)
+            timer.daemon = True
+            timer.start()
+        else:
+            log("time limit approaching: marked chain for continuation and sending SIGTERM to the law payload")
+            hard_stop()
 
     old_handler = signal.signal(signal.SIGUSR1, on_usr1)
     try:
@@ -111,6 +136,8 @@ def run_chain_payload(
         if not wait_group_gone(child.pid):
             log("processes of the law payload outlived the grace period and were killed")
     finally:
+        if timer is not None:
+            timer.cancel()
         signal.signal(signal.SIGUSR1, old_handler)
 
     log(f"law payload finished with exit code {rc} (pre-timeout signal received: {timed_out})")

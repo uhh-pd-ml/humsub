@@ -59,6 +59,10 @@ def _add_slurm_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reservation", help="Slurm reservation")
     parser.add_argument("--mail", help="e-mail address for failure notifications")
     parser.add_argument("--max-hops", type=int, help="maximum number of Slurm jobs (hops) in one chain")
+    parser.add_argument("--signal-seconds", type=int, dest="signal_seconds",
+                        help="the soft-stop notice comes this many seconds before the time limit of a hop")
+    parser.add_argument("--grace-seconds", type=int, dest="grace_seconds",
+                        help="seconds between the soft-stop notice and the hard SIGTERM (-1 automatic, 0 = no soft stop)")
     parser.add_argument(
         "--nice", type=int, dest="nice",
         help="Slurm --nice of every chain job incl. continuation hops (default [slurm].nice = 1000000: other users' jobs "
@@ -254,7 +258,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def _cli_overrides(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
     slurm: dict[str, Any] = {}
-    for attr in ("account", "partition", "reservation", "mail", "max_hops", "nice"):
+    for attr in ("account", "partition", "reservation", "mail", "max_hops", "nice", "signal_seconds", "grace_seconds"):
         value = getattr(args, attr, None)
         if value is not None:
             slurm[attr] = value

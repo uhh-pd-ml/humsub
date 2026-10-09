@@ -155,6 +155,8 @@ def submit_manifest_run(
         for branch in manifest["branches"]:
             for output in branch["outputs"]:
                 check_compute_writable(Path(output), f"branch {branch['id']} output", must_be_shared=True)
+            for output in branch.get("extra_outputs", []):
+                check_compute_writable(Path(output), f"branch {branch['id']} extra output", must_be_shared=True)
     else:
         print("[submit] WARNING: filesystem/path validation disabled by --skip-path-checks", file=sys.stderr)
 

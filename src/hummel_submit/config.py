@@ -38,6 +38,10 @@ DEFAULTS: dict[str, Any] = {
         "gpus": 1,
         "time_limit": "24:00:00",
         "signal_seconds": 600,
+        # Soft stop: at `time_limit - signal_seconds` the payload is only *notified* (file named in
+        # HUMSUB_SOFT_STOP_FILE) and may finish if it is nearly done; SIGTERM follows `grace_seconds` later.
+        # -1 = automatic (signal_seconds - 150, so the hard stop stays ~2 min before the limit); 0 = hard stop at once.
+        "grace_seconds": -1,
         "mail": "",
         "reservation": "",
         "max_hops": 20,
@@ -58,6 +62,8 @@ DEFAULTS: dict[str, Any] = {
 }
 
 SCRATCH_KINDS = ("beegfs", "ssd")
+GRACE_MARGIN = 150   # automatic grace = signal_seconds - GRACE_MARGIN
+GRACE_RESERVE = 90   # an explicit grace must leave this much of the window (SIGTERM, 45 s kill grace, cleanup)
 
 _ALLOWED = {section: set(values) for section, values in DEFAULTS.items()}
 
@@ -211,7 +217,7 @@ def validate_config(config: dict[str, Any], *, require_command: bool = True) -> 
         raise ConfigError(f"[execution].scratch must be one of {', '.join(SCRATCH_KINDS)}")
     if not isinstance(exe["fast_bytes_per_job"], int) or exe["fast_bytes_per_job"] < 0:
         raise ConfigError("[execution].fast_bytes_per_job must be a non-negative integer")
-    for key in ("nodes", "gpus", "signal_seconds", "max_hops", "nice"):
+    for key in ("nodes", "gpus", "signal_seconds", "max_hops", "nice", "grace_seconds"):
         if not isinstance(slurm[key], int) or isinstance(slurm[key], bool):
             raise ConfigError(f"[slurm].{key} must be an integer")
     if slurm["nodes"] < 1:
@@ -222,6 +228,13 @@ def validate_config(config: dict[str, Any], *, require_command: bool = True) -> 
         raise ConfigError("[slurm].signal_seconds must be >= 1")
     if slurm["max_hops"] < 1:
         raise ConfigError("[slurm].max_hops must be >= 1")
+    if slurm["grace_seconds"] < -1:
+        raise ConfigError("[slurm].grace_seconds must be >= 0, or -1 for automatic")
+    if slurm["grace_seconds"] > 0 and slurm["grace_seconds"] > slurm["signal_seconds"] - GRACE_RESERVE:
+        raise ConfigError(
+            f"[slurm].grace_seconds ({slurm['grace_seconds']}) must leave at least {GRACE_RESERVE} s of the "
+            f"signal window ({slurm['signal_seconds']} s) for the hard stop and cleanup"
+        )
     if slurm["nice"] < 0:
         raise ConfigError("[slurm].nice must be >= 0 (0 disables the priority penalty)")
 
@@ -272,6 +285,14 @@ def slurm_time_seconds(value: str) -> int | None:
     else:  # M or M:S
         hours, minutes, seconds = 0, int(first), int(second or 0)
     return ((int(days or 0) * 24 + hours) * 60 + minutes) * 60 + seconds
+
+
+def effective_grace_seconds(slurm: dict[str, Any]) -> int:
+    """Seconds between the soft-stop notice and the hard SIGTERM of a hop."""
+    value = int(slurm.get("grace_seconds", -1))
+    if value < 0:
+        return max(0, int(slurm["signal_seconds"]) - GRACE_MARGIN)
+    return value
 
 
 def check_signal_window(config: dict[str, Any], *, resubmit: bool) -> None:

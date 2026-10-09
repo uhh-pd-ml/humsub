@@ -100,6 +100,12 @@ humsub cleanup SUBMISSION_ID             # delete the staged inputs on the SSD o
   `/tmp` and `/dev/shm` are rejected at submission).  **A branch is complete exactly when all of its outputs
   exist.**  This is law's completeness test, so it also makes submission idempotent: re-submitting a
   manifest launches only branches with missing outputs, and says "nothing to submit" if none are missing.
+* `extra_outputs` (optional, same path rules, files **or directories**) are results that are good to have but **not part of the
+  contract**: debug files, logs, and above all **checkpoints**.  humsub never counts them for completion, **never deletes them**
+  (required outputs are wiped before every attempt and after every failure; extra outputs are not), never cleans them up, and lists
+  them in the branch context (`"extra_outputs": [...]`).  Their paths are fixed in the manifest, so they are identical in every
+  submission of a lineage: a checkpoint written in one hop is found by the next hop, by a retry, by `humsub resume`, and by a later
+  study that points at the same path (e.g. to continue training on more data).  Retention is the manifest author's decision.
 
 ## The payload
 
@@ -129,6 +135,8 @@ Environment (in addition to what the Hummel batch environment provides; jobs sta
 | `HUMSUB_STAGE_<NAME>` | staged path of `--stage NAME=…` (name upper-cased, non-alphanumerics → `_`) |
 | `HUMSUB_PAYLOAD` | path of the frozen payload |
 | `HUMSUB_PAYLOAD_ATTEMPT` | 1 on the first run of the payload, +1 for every `--retry-payload` re-run inside the same job |
+| `HUMSUB_SOFT_STOP_FILE` | path of a file that appears when the hop runs out of time (the soft-stop notice, see below); poll for its existence |
+| `HUMSUB_SOFT_STOP_AT`, `HUMSUB_HARD_STOP_AT` | expected epoch seconds of the soft-stop notice and of the SIGTERM that follows it (Slurm delivers its signal up to 30 s early); only set when the chain can continue |
 | `HUMSUB_HOP_START`, `HUMSUB_HOP_USABLE_SECONDS` | epoch seconds at which the hop started and how many seconds of it are usable (time limit minus the signal window); `humsub` uses them for the time-aware retry rule, a payload may use them too |
 | `HUMSUB_ATTEMPT` | law's in-job attempt counter (`LAW_JOB_ATTEMPT`); **always 1**, because a `--retries` resubmission is a new job. Keep your own state if a payload must know it is being retried |
 | `HUMSUB_CHAIN_ID`, `HUMSUB_HOP`, `HUMSUB_STATE_PATH` | chain id, hop number (0-based) and state file of the surrounding chain |
@@ -142,11 +150,11 @@ Rules:
    `<run_dir>/leftovers/<jobid>-<branch>/`; the scratch itself is removed.
 2. **Write atomically** (temporary name next to the target, then rename): scratch and the declared outputs may be
    on different filesystems, so copy from scratch to a temporary name beside the target and rename that.
-3. **Be restartable.**  A hop ends with SIGTERM to the payload's process group (it runs in its own session; `humsub`
-   forwards the signal, waits up to 45 s, then SIGKILLs it and removes the scratch) shortly before the time limit; the
-   next hop re-runs the whole branch from the beginning (branches that already completed are skipped, a
-   branch that was running is restarted).  Branches should therefore be much shorter than `time_limit`, or
-   checkpoint on their own.
+3. **Be restartable.**  A hop ends in two steps (below): first a *soft-stop notice*, later SIGTERM to the payload's process group
+   (it runs in its own session; `humsub` forwards the signal, waits up to 45 s, then SIGKILLs it and removes the scratch).
+   The next hop re-runs the whole branch from the beginning (branches that already completed are skipped, a branch that was
+   running is restarted).  Branches should therefore be much shorter than `time_limit`, or checkpoint on their own
+   (keep the checkpoint in an `extra_outputs` path).
 4. **Containers belong inside the payload** (law and the chain run on the host).  A payload that needs a
    runtime calls it itself, e.g. `cmsexec …` or `apptainer exec …`.
 5. `$HOME` and `$USW` are read-only in batch; write to `$BEEGFS`, `$SSD`, `HUMSUB_SCRATCH` or `HUMSUB_SCRATCH_FAST`.
@@ -202,7 +210,8 @@ nv = true                                      # apptainer --nv
 [slurm]
 job_name = "job"      account = "kasieczka_gpu"   partition = "gpu"   nodes = 1   gpus = 1
 time_limit = "24:00:00"     # per hop
-signal_seconds = 600        # a hop is stopped this long BEFORE time_limit; must be < time_limit
+signal_seconds = 600        # the soft-stop notice comes this long BEFORE time_limit; must be < time_limit
+grace_seconds = -1          # notice -> SIGTERM delay: -1 = signal_seconds - 150, 0 = no soft stop (SIGTERM at once)
 max_hops = 20               # at most this many Slurm jobs per chain
 nice = 1000000              # Slurm --nice of every chain job: other users' jobs go first; 0 = explicit opt-out
 supervisor_partition = ""   # partition of --supervisor-job (default: same as `partition`)
@@ -246,7 +255,7 @@ humsub config [--json]                         show resolved configuration
 humsub submit-manifest --manifest M --payload P [--stage N=PATH]… [--stage-exclude N=PATTERN]…
         [--run-name NAME] [--wait] [--retries R] [--tasks-per-job K] [--parallel-jobs J] [--dry-run]
         [--no-resubmit] [--time T] [--account A] [--partition P] [--reservation R] [--mail M]
-        [--max-hops H] [--nice N] [--sbatch-arg ARG]… [--skip-path-checks]
+        [--max-hops H] [--nice N] [--signal-seconds S] [--grace-seconds G] [--sbatch-arg ARG]… [--skip-path-checks]
         [--retry-payload N | --safety-margin F] [--max-concurrent N] [--scratch beegfs|ssd]
         [--supervisor-job [--supervisor-interval S] [--supervisor-rounds R]] [--ignore-quota-check]
 humsub resume SUBMISSION [--dry-run] [--include-active] [--stage N=PATH]… [same policy options]
@@ -274,6 +283,24 @@ treated as `submit` (`humsub -- --epochs=3` ≡ `humsub submit -- --epochs=3`).
 * `--dry-run`: validate the manifest, stages and paths and print the plan; submit nothing.
 * Path checks run before anything is created (`--skip-path-checks` disables them): shared output
   directory, writable cache directory, every declared output location.
+
+### Hop boundaries: the soft stop
+
+At `time_limit - signal_seconds` Slurm signals the chain worker.  Earlier versions then killed the payload immediately, which wasted the
+rest of the window and cost a whole extra hop (with the nice penalty: another wait in the queue) for a payload that needed three more
+minutes.  Now:
+
+1. **Soft-stop notice.**  The file named in `HUMSUB_SOFT_STOP_FILE` is created and the chain is marked for continuation.  *No signal is
+   sent* (the default action of SIGUSR2 would kill payloads that do not know it); payloads poll the file, between epochs, files or events.
+   A payload that can finish before `HUMSUB_HARD_STOP_AT` simply does.  A payload that cannot should checkpoint and exit non-zero
+   (any code): once the notice exists this is treated as a hop boundary, **not as a failure** (no retry, no failure budget used).
+2. **Next branch of a multi-branch chain is not started** after the notice (it would only be killed); the follower hop runs it.
+3. **SIGTERM** follows `grace_seconds` after the notice (default `signal_seconds - 150`, so it still lands ~2 minutes before the limit;
+   an explicit value must leave at least 90 s of the window).  `grace_seconds = 0` restores the old behaviour.
+4. If the payload completes inside the grace window and nothing is left in the job, the chain ends as *completed* and the queued follower
+   is cancelled; otherwise the follower continues.
+
+`--signal-seconds` and `--grace-seconds` override both values per submission.
 
 ### Concurrency, scratch and the SSD quota
 

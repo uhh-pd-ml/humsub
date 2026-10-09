@@ -71,7 +71,9 @@ def main(argv: list[str] | None = None) -> int:
         _mark_done(state_path, "failed-to-start", error=str(exc), exit_code=2)
         return 2
 
-    if rc == 0 and not timed_out:
+    if rc == 0:
+        # Also when the soft-stop notice had been given: law exits 0 only if every branch of the job is complete,
+        # i.e. the payload finished inside the grace window and there is nothing left to continue.
         log("law payload completed normally; stopping chain")
         if next_job:
             cancel_jobs([next_job])
