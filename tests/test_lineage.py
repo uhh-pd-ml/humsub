@@ -170,3 +170,4 @@ def test_supervisor_can_use_its_own_account_and_partition(tmp_path: Path) -> Non
     spec_path.write_text(json.dumps(spec))
     args = supervisor_command(spec_path, 1)
     assert "--account=grp_gpu" in args and "--partition=gpu" in args
+    assert not any(a.startswith("--nice") for a in args), "the watchdog must not be starved by the chains' nice penalty"

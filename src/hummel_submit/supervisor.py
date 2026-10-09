@@ -56,8 +56,8 @@ def supervisor_command(spec_path: Path, round_no: int, checks: int = 1) -> list[
         f"--output={Path(spec['output_dir']) / 'logs'}/%x_%j.log",
         f"--begin=now+{interval}",
     ]
-    if slurm.get("nice", 0) > 0:
-        args.append(f"--nice={slurm['nice']}")
+    # Deliberately NOT niced: it is a 1-CPU, 30-minute watchdog.  With the chains' nice penalty it can starve for hours on a busy
+    # partition (seen on Hummel-2: pending > 6 h), which defeats its purpose as a safety net.
     args += [str(script), spec["python_executable"], str(snapshot), str(spec_path), f"{round_no}:{checks}"]
     return args
 

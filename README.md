@@ -304,7 +304,7 @@ There are three layers; choose the one that fits, you do not need all of them.
    proxy is picked up).  `humsub submission-status` ends with the lineage summary: branches done / in flight / missing.
    `--supervisor-job` automates this: a one-CPU job re-queues itself every `--supervisor-interval` seconds (min 60, default
    1800); while chains are alive it only waits, when none is alive and branches are missing it runs `resume`, at most
-   `--supervisor-rounds` times (default 3), then stops.  `scrontab` is disabled on Hummel-2, so this is the cron substitute
+   `--supervisor-rounds` times (default 3), then stops.  The supervisor is never niced (a niced watchdog starves on a busy partition).  `scrontab` is disabled on Hummel-2, so this is the cron substitute
    inside the cluster; `humsub resume` from your own cron works as well.
 4. **`--wait --retries R`** (controller based, legacy): law keeps polling and resubmits failed branches while the
    submitting process lives.  A failed chain is otherwise **not** continued.
