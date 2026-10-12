@@ -86,6 +86,7 @@ def create_submission_spec(
     user_args: list[str],
     resubmit: bool,
     python_executable: str,
+    extra: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Path]:
     submission_id = make_submission_id()
     sdir = submission_root(output_dir) / submission_id
@@ -131,6 +132,8 @@ def create_submission_spec(
         "python_executable": str(python_path),
         "chain_ids": [],
     }
+    if extra:
+        data.update(extra)
     path = sdir / "submission.json"
     atomic_write_json(path, data)
     return data, path

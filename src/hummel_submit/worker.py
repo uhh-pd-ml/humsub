@@ -46,7 +46,8 @@ def main(argv: list[str] | None = None) -> int:
         _mark_done(state_path, "stopped-no-continuation-marker")
         return 0
 
-    max_hops = slurm["max_hops"]
+    budget = int(state.get("failure_budget", 0))
+    max_hops = slurm["max_hops"] + budget
     log(f"run={state['run_name']} chain={state['chain_id']} job {hop + 1} of at most {max_hops}")
 
     next_job: str | None = None
@@ -70,7 +71,9 @@ def main(argv: list[str] | None = None) -> int:
         _mark_done(state_path, "failed-to-start", error=str(exc), exit_code=2)
         return 2
 
-    if rc == 0 and not timed_out:
+    if rc == 0:
+        # Also when the soft-stop notice had been given: law exits 0 only if every branch of the job is complete,
+        # i.e. the payload finished inside the grace window and there is nothing left to continue.
         log("law payload completed normally; stopping chain")
         if next_job:
             cancel_jobs([next_job])
@@ -95,7 +98,25 @@ def main(argv: list[str] | None = None) -> int:
         _mark_done(state_path, "stopped-no-follower", exit_code=1)
         return 1
 
+    used = int(state.get("failures_used", 0))
+    if next_job and used < budget:
+        # Safety margin: the follower hop (already queued with afterany) re-runs the chain; law skips
+        # every branch whose outputs exist, so only the failed and not-yet-run branches are repeated.
+        (state_path.parent / f"continue-{hop}").touch()
+        mark_status(
+            state_path,
+            f"retrying-after-failure-hop-{hop + 1}",
+            current_job_id=job_id,
+            next_job_id=next_job,
+            failures_used=used + 1,
+            last_failure_exit_code=rc,
+        )
+        log(f"law payload failed with exit code {rc}; failure budget {used + 1}/{budget} used, follower hop will retry")
+        return rc if 0 < rc <= 255 else 1
+
     log(f"law payload failed with exit code {rc}; stopping chain")
+    if budget and used >= budget:
+        log(f"failure budget of {budget} retry hop(s) exhausted")
     if next_job:
         cancel_jobs([next_job])
     _mark_done(state_path, f"failed-{rc}", exit_code=rc)
