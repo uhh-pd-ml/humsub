@@ -153,3 +153,17 @@ def append_submission_chain(path: Path, chain_id: str) -> dict[str, Any]:
         atomic_write_json(path, data)
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     return data
+
+
+def append_spec_list(path: Path, key: str, value: Any) -> dict[str, Any]:
+    """Append *value* to the list ``spec[key]`` of a submission under the submission lock."""
+    lock_path = path.parent / ".submission.lock"
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        data = load_submission_spec(path)
+        items = data.setdefault(key, [])
+        if value not in items:
+            items.append(value)
+        atomic_write_json(path, data)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    return data
