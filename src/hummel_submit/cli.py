@@ -39,6 +39,9 @@ from .manifest_submit import (
     print_manifest_submission as _print_manifest_submission,
     submit_manifest_run,
 )
+from .doctor import local_checks, manifest_paths, run_probe
+from .prune import apply_plan, fmt as fmt_size, plan_submission, select_submissions as select_prune_submissions
+from .stats import format_stats, stats_for, to_json as stats_json
 from .lineage import (
     compute_overview,
     find_submission,
@@ -206,6 +209,29 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--parallel-jobs", type=int, default=None, help="rolling submission width (needs --wait)")
     _add_slurm_options(resume)
     _add_manifest_policy_options(resume)
+
+    stats = sub.add_parser("stats", help="what a production cost: jobs, runtimes, core-hours, queue waits, failures, retries, peak concurrency")
+    stats.add_argument("submission", help="submission id or run name of any submission of the lineage")
+    stats.add_argument("--json", action="store_true", help="machine-readable output")
+
+    prune = sub.add_parser(
+        "prune",
+        help="delete the provenance (state, chains, run dir, Slurm logs, caches) of selected finished submissions; dry run unless --apply",
+    )
+    prune.add_argument("--run", action="append", default=[], metavar="NAME", help="run name (repeatable)")
+    prune.add_argument("--id", action="append", default=[], metavar="PREFIX", help="submission id or prefix (repeatable)")
+    prune.add_argument("--before", metavar="YYYY-MM-DD", help="all submissions created before this date")
+    prune.add_argument("--lineage", action="store_true", help="also select every submission derived from a selected one (resumes)")
+    prune.add_argument("--apply", action="store_true", help="actually delete (default: show what would be deleted)")
+    prune.add_argument("--force", action="store_true", help="also prune submissions that still look active")
+
+    doctor = sub.add_parser("doctor", help="check that this setup can run a production; --probe also tests from a real batch node")
+    doctor.add_argument("--probe", action="store_true", help="run a tiny batch job: writes to the output locations, nested sbatch, humsub importable")
+    doctor.add_argument("--check-path", action="append", default=[], type=Path, metavar="PATH", help="also check that a batch node can write here (repeatable)")
+    doctor.add_argument("--manifest", type=Path, help="check the common output location of this manifest")
+    doctor.add_argument("--timeout", type=int, default=300, help="seconds to wait for the probe job (default 300)")
+    doctor.add_argument("--keep-nice", action="store_true", help="queue the probe with the configured nice instead of 0")
+    doctor.add_argument("--cpu-only", action="store_true", help="do not request the configured GPUs for the probe")
 
     submission_status = sub.add_parser(
         "submission-status", help="summarize all autonomous chains belonging to one submission"
@@ -518,6 +544,85 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def _lineage_context(ident: str) -> tuple[Path, Path, dict[str, Any]]:
+    config, _ = load_config(Path.cwd(), require_command=False)
+    output_dir = Path(config["execution"]["output_dir"])
+    spec_path = find_submission(output_dir, ident)
+    return output_dir, spec_path, load_submission_spec(spec_path)
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    output_dir, _, spec = _lineage_context(args.submission)
+    summary = stats_for(output_dir, spec, str(spec["config"]["slurm"]["job_name"]))
+    if args.json:
+        print(stats_json(summary))
+    else:
+        print(f"lineage {spec.get('lineage', {}).get('id', spec['submission_id'])} (run {spec['run_name']})")
+        for line in format_stats(summary):
+            print(line)
+    return 0
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    if not (args.run or args.id or args.before):
+        raise ConfigError("select what to prune with --run, --id or --before")
+    config, _ = load_config(Path.cwd(), require_command=False)
+    output_dir = Path(config["execution"]["output_dir"])
+    chosen = select_prune_submissions(output_dir, args.run, args.before, args.id)
+    if args.lineage:
+        from .lineage import lineage_id, lineage_specs
+        lids = {lineage_id(load_submission_spec(p)) for p in chosen}
+        chosen = sorted({p for lid in lids for p, _ in lineage_specs(output_dir, lid)} | set(chosen))
+    if not chosen:
+        print("prune: nothing matches")
+        return 0
+    all_specs = list(iter_submission_specs(output_dir))
+    plans = [plan_submission(output_dir, p) for p in chosen]
+    total = 0
+    refused = 0
+    for plan in plans:
+        size = plan.size()
+        active = plan.state == "active"
+        total += 0 if (active and not args.force) else size
+        print(f"prune: submission {plan.submission_id} run {plan.run_name} [{plan.state}] {fmt_size(size)} in {len(plan.paths)} path(s)"
+              + ("  REFUSED: still active (use --force)" if active and not args.force else ""))
+        counts: dict[str, int] = {}
+        for label, _ in plan.paths:
+            counts[label] = counts.get(label, 0) + 1
+        print("prune:   " + ", ".join(f"{n} {k}" for k, n in sorted(counts.items())))
+        for note in plan.skipped:
+            print(f"prune:   KEPT (safety): {note}")
+        refused += int(active and not args.force)
+    print(f"prune: {len(plans)} submission(s) selected, {len(all_specs) - len(plans)} other submission(s) of this output_dir are untouched; {fmt_size(total)} to reclaim")
+    if not args.apply:
+        print("prune: dry run; pass --apply to delete")
+        return 1 if refused else 0
+    for plan in plans:
+        if plan.state == "active" and not args.force:
+            continue
+        apply_plan(plan)
+    print("prune: done (declared outputs of the manifests were never touched)")
+    return 1 if refused else 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    config, sources = load_config(Path.cwd(), require_command=False)
+    extra = list(args.check_path)
+    if args.manifest:
+        extra += manifest_paths(args.manifest.expanduser().absolute())
+    checks = local_checks(config, extra)
+    if args.probe:
+        output_dir = Path(config["execution"]["output_dir"])
+        paths = [output_dir, Path(config["execution"]["cache_dir"]), *extra]
+        print("doctor: probe job submitted, waiting for a batch node ...", flush=True)
+        checks += run_probe(config, output_dir, paths, args.timeout, keep_nice=args.keep_nice, cpu_only=args.cpu_only)
+    for check in checks:
+        print(check.line())
+    failed = [c for c in checks if c.status == "fail"]
+    print(f"doctor: {len(failed)} failed, {sum(c.status == 'warn' for c in checks)} warning(s)" + ("" if args.probe else "; run with --probe for the checks that need a batch node"))
+    return 1 if failed else 0
+
+
 def cmd_submission_status(args: argparse.Namespace) -> int:
     config, _ = load_config(Path.cwd(), require_command=False)
     output_dir = Path(config["execution"]["output_dir"])
@@ -729,7 +834,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = {"help", "init", "config", "submit", "submit-manifest", "resume", "status", "follow", "submission-status", "cleanup", "gc", "cancel"}
+    commands = {"help", "init", "config", "submit", "submit-manifest", "resume", "status", "follow", "submission-status", "cleanup", "gc", "cancel", "stats", "prune", "doctor"}
     top_level = {"-h", "--help", "--version"}
     if argv and argv[0] not in commands and argv[0] not in top_level:
         argv.insert(0, "submit")
@@ -759,6 +864,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_gc(args)
         if args.subcommand == "cancel":
             return cmd_cancel(args)
+        if args.subcommand == "stats":
+            return cmd_stats(args)
+        if args.subcommand == "prune":
+            return cmd_prune(args)
+        if args.subcommand == "doctor":
+            return cmd_doctor(args)
         parser.error("unknown command")
     except (ConfigError, PathCheckError, SlurmError, OSError, RuntimeError, ValueError) as exc:
         print(f"humsub: error: {exc}", file=sys.stderr)

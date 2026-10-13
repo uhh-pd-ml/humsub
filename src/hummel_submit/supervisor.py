@@ -14,7 +14,7 @@ import sys
 from .lineage import compute_overview, format_overview, resume
 from .slurm import SlurmError, slurm_command
 from .state import write_worker_snapshot
-from .submission import load_submission_spec
+from .submission import append_spec_list, load_submission_spec
 
 SUPERVISOR_TIME = "00:30:00"
 MAX_CHECKS = 2000
@@ -68,7 +68,9 @@ def submit_supervisor(spec_path: Path, round_no: int, checks: int = 1) -> str:
         proc = subprocess.run(cmd, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise SlurmError(f"supervisor sbatch failed: {getattr(exc, 'stderr', '') or exc}") from exc
-    return proc.stdout.strip().split(";", 1)[0]
+    job_id = proc.stdout.strip().split(";", 1)[0]
+    append_spec_list(spec_path, "supervisor_job_ids", job_id)   # so that `humsub stats` and `humsub prune` can attribute its logs
+    return job_id
 
 
 def decide(*, missing: int, active_branches: int, round_no: int, max_rounds: int, checks: int) -> str:

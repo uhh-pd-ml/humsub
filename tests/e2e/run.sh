@@ -10,7 +10,10 @@
 #   IMAGE            image to use (default ghcr.io/uhh-pd-ml/hummel-slurm-ci:latest)
 #   WHEELHOUSE       directory of wheels (law, luigi, pytest, setuptools, wheel and
 #                    their dependencies); installs offline from it instead of from
-#                    the network, e.g. when the container has no working DNS
+#                    the network.  If unset, one is built on the *host* (which has network)
+#                    into ${XDG_CACHE_HOME:-~/.cache}/humsub-e2e-wheelhouse on first use and
+#                    re-used afterwards -- containers usually have no working DNS.
+#                    NO_WHEELHOUSE=1 installs from the network inside the container instead.
 #   DOCKER_RUN_FLAGS extra `docker run` flags, e.g. --cpus=2 to mimic a small CI runner
 #   KEEP_CONTAINER=1 leave the container running afterwards (docker exec -u testuser ...)
 #   COVERAGE=1       measure coverage of hummel_submit in *all* processes (law, chain
@@ -20,7 +23,20 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 REPO="$PWD"
-IMAGE="${IMAGE:-ghcr.io/uhh-pd-ml/hummel-slurm-ci:latest}"
+# the image: IMAGE, else a locally available hummel-slurm-ci, else the one on ghcr.io
+if [ -z "${IMAGE:-}" ]; then
+    if docker image inspect hummel-slurm-ci:latest >/dev/null 2>&1; then IMAGE=hummel-slurm-ci:latest
+    else IMAGE=ghcr.io/uhh-pd-ml/hummel-slurm-ci:latest; fi
+fi
+# the wheelhouse: build it on the host once (see above)
+if [ -z "${WHEELHOUSE:-}" ] && [ "${NO_WHEELHOUSE:-0}" != 1 ]; then
+    WHEELHOUSE="${XDG_CACHE_HOME:-$HOME/.cache}/humsub-e2e-wheelhouse"
+    if [ -z "$(ls -A "$WHEELHOUSE" 2>/dev/null)" ]; then
+        echo "building the wheelhouse in $WHEELHOUSE (once) ..."
+        mkdir -p "$WHEELHOUSE"
+        python3 -m pip wheel -q -w "$WHEELHOUSE" "law @ git+https://github.com/riga/law.git@master" pytest setuptools wheel coverage
+    fi
+fi
 NAME="${CONTAINER_NAME:-humsub-e2e}"
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true

@@ -266,6 +266,9 @@ humsub follow CHAIN [-n LINES]                 follow the active log across hops
 humsub cancel CHAIN                            scancel all jobs of the chain and mark it failed
 humsub cleanup SUBMISSION [--dry-run] [--force]
 humsub gc [--apply] [--successful-after-hours H] [--failed-after-hours H] [--orphans-after-hours H] [--stale-scratch]
+humsub stats SUBMISSION [--json]               what the production cost: jobs, runtimes, core-hours, queue waits, failures, peak concurrency
+humsub prune (--run NAME | --id PREFIX | --before DATE)… [--lineage] [--apply] [--force]     delete the provenance of finished submissions
+humsub doctor [--probe] [--check-path P]… [--manifest M] [--timeout S]    can this setup run a production? (--probe: from a batch node)
 humsub help                                    same as --help
 ```
 
@@ -343,6 +346,34 @@ There are three layers; choose the one that fits, you do not need all of them.
 
 Resubmitting the same manifest with a fresh `--run-name` still skips branches whose outputs exist *if the manifest's
 output paths do not contain the run name*; `resume` does not depend on that.
+
+### Doctor: check the setup before a production
+
+`humsub doctor` answers, in seconds, the questions that are cheap before and expensive after submitting thousands of jobs: does the configuration
+resolve, are `output_dir` and `cache_dir` usable, does the scheduler answer, how full is the SSD quota, can law be imported?  With **`--probe`** it
+also submits one tiny job (the account, partition and GPU request of your configuration, queued with `--nice 0` unless `--keep-nice`; waits `--timeout`
+seconds, default 300) and reports what a *batch node* can do:
+
+* write to `output_dir`, `cache_dir`, every `--check-path` and the common output location of a `--manifest` — group folders and other users'
+  trees often look fine from the frontend and are not writable from a compute node;
+* call `sbatch` (required by `--supervisor-job`), see `$HOME`/`$USW` read-only as expected, and import humsub and law with the interpreter the chains will use;
+* the account/partition/GPU combination is accepted (the probe is submitted with exactly that request).
+
+Exit status 1 if anything failed.  A probe that does not start within the timeout is a warning (busy cluster), not a failure.
+
+### Stats: what did it cost?
+
+`humsub stats SUBMISSION` (any submission or run name of the lineage) sums up the whole lineage — the original submission, its resumes and supervisor jobs — from the
+chain state and `sacct`: job counts by state, runtimes of the completed jobs (min/median/max/total), core-hours of everything that ran, the share spent in failed or
+cancelled jobs, queue waits, wall-clock, how many chains needed more than one job (continuations or retry hops) and the peak number of jobs running at once.  `--json` for scripts.
+
+### Cleaning up provenance: prune
+
+`gc` removes SSD caches; the submission records, chain state, run directories and Slurm logs are provenance and stay.  When a production has been verified and its results moved,
+`humsub prune` deletes that provenance for *selected submissions only* (`--run NAME`, `--id PREFIX`, `--before YYYY-MM-DD`; `--lineage` adds every resume derived from a selected one).
+It deletes what the selected submissions **own** — their submission and chain directories, their run directory, the Slurm logs of exactly their job ids (supervisor jobs included) and their
+staging and scratch caches — and nothing else: older runs, other projects' logs in the same `output_dir` and, always, every output declared in a manifest are untouched (a directory that
+contains a declared output is kept with a note).  It is a dry run unless `--apply`; submissions that still look active are refused unless `--force`.
 
 ### Cleaning up
 
@@ -426,4 +457,7 @@ The end-to-end tests run inside the Docker image from
 [hummel-slurm-ci](https://github.com/uhh-pd-ml/hummel-slurm-ci) (Slurm 24.11 with Hummel's partitions,
 accounts, submit filter and `/sw/batch/init.sh`); they submit real manifests, chains, failures,
 cancellations and a pre-timeout continuation.  Set `WHEELHOUSE=dir` to install from local wheels when the
-container has no network.
+container has no network.  Without `WHEELHOUSE`, `run.sh` builds a wheelhouse on the *host* once
+(`~/.cache/humsub-e2e-wheelhouse`, needs `pip` and network) because the container usually has no working DNS; `NO_WHEELHOUSE=1`
+installs from the network inside the container instead.  `IMAGE=` selects the image; by default a locally available `hummel-slurm-ci:latest`
+is used, else the one on ghcr.io.  A full run (unit + e2e incl. slow tests) takes about 15 minutes.
