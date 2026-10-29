@@ -38,9 +38,10 @@ def test_doctor_reports_an_unusable_location_and_exits_nonzero(project):
 def test_stats_and_prune_after_two_runs(project):
     res = _results(project)
     payload = project.write_payload("""
-        import json, sys
+        import json, sys, time
         from pathlib import Path
         ctx = json.loads(Path(sys.argv[1]).read_text())
+        time.sleep(2)              # measurable runtime for the stats assertions (sacct has 1 s resolution)
         Path(ctx["outputs"][0]).write_text(ctx["run_name"])
     """)
     runs = {}
@@ -60,7 +61,7 @@ def test_stats_and_prune_after_two_runs(project):
     assert "core-hours" in text and "peak running" in text
 
     chains = json.loads((project.out / ".hummel-submit" / "chains" / sub.chains[0] / "state.json").read_text())["jobs"]
-    logs = lambda ids: [project.out / "logs" / f"e2e_{j}.log" for j in ids]
+    logs = lambda ids: [project.out / "logs" / f"{project.job_name}_{j}.log" for j in ids]
     keep_chains = json.loads((project.out / ".hummel-submit" / "chains" / runs["keep"][0].chains[0] / "state.json").read_text())["jobs"]
     existing = lambda ids: [p for p in logs(ids) if p.exists()]       # a cancelled follower never wrote a log
     assert existing(chains), "the job ran and wrote a log"

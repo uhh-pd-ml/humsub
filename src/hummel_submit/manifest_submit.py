@@ -245,12 +245,12 @@ def submit_manifest_run(
             from .manifest_workflow import ManifestPayloadWorkflow
         except ImportError as exc:
             raise ConfigError(
-                "law (master) is required for manifest submission; reinstall hummel-submit with its dependencies"
+                "law is required for manifest submission; reinstall hummel-submit with its dependencies"
             ) from exc
 
         task = ManifestPayloadWorkflow(
             humsub_spec=str(spec_path),
-            workflow="slurm",
+            workflow="hummel",
             no_poll=not opts.wait,
             retries=opts.retries,
             tasks_per_job=opts.tasks_per_job,

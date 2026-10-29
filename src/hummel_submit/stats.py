@@ -85,7 +85,9 @@ def summarize(rows: list[dict[str, Any]], per_chain: dict[str, int] | None = Non
     work = [r for r in rows if supervisor_name not in r["name"]]
     watchdog = [r for r in rows if supervisor_name in r["name"]]
     states = collections.Counter(r["state"] for r in work)
-    ran = [r for r in work if r["start"] is not None and r["elapsed"] > 0]
+    # sacct's Elapsed has 1 s resolution: a job that finished within its first second shows 0 but did run.  A
+    # follower cancelled while pending can also get a start time and 0 s; that one never ran.
+    ran = [r for r in work if r["start"] is not None and (r["elapsed"] > 0 or r["state"] not in ("CANCELLED", "PENDING"))]
     done = [r["elapsed"] for r in work if r["state"] == "COMPLETED"]
     waits = [(r["start"] - r["submit"]).total_seconds() for r in work if r["start"] and r["submit"]]
     out: dict[str, Any] = {
@@ -112,7 +114,8 @@ def summarize(rows: list[dict[str, Any]], per_chain: dict[str, int] | None = Non
     for _, d in events:
         cur += d
         peak = max(peak, cur)
-    out["peak_concurrency"] = peak
+    # a 0 s job's end sorts before its start; any job that ran means at least one ran at a time
+    out["peak_concurrency"] = max(peak, 1 if ran else 0)
     if per_chain:
         out["chains"] = len(per_chain)
         out["chains_with_more_than_one_job"] = sum(1 for n in per_chain.values() if n > 1)

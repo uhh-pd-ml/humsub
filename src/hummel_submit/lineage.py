@@ -78,7 +78,10 @@ def find_submission(output_dir: Path, ident: str) -> Path:
 def chain_branch_map(spec_path: Path) -> dict[str, list[int]]:
     """chain id -> branch ids, from law's control files of one submission."""
     mapping: dict[str, list[int]] = {}
-    for control in sorted((spec_path.parent / "law" / "control").glob("slurm_jobs_*.json")):
+    control_dir = spec_path.parent / "law" / "control"
+    # law names the file after the workflow type: "hummel" since humsub 0.5, "slurm" before.
+    controls = sorted(control_dir.glob("hummel_jobs_*.json")) + sorted(control_dir.glob("slurm_jobs_*.json"))
+    for control in controls:
         try:
             data = json.loads(control.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):

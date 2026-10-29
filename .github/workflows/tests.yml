@@ -32,5 +32,5 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Pull the Hummel Slurm image
         run: docker pull ghcr.io/uhh-pd-ml/hummel-slurm-ci:latest
-      - name: End-to-end tests (including the slow continuation test)
+      - name: End-to-end tests (all, slow ones included; 4 parallel workers, see E2E_WORKERS in run.sh)
         run: tests/e2e/run.sh -x

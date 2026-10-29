@@ -130,7 +130,8 @@ def query_chain(output_dir: Path, chain_id: str) -> ChainStatus:
         return ChainStatus(chain_id, "failed", code=int(code or 1), error=error or raw_status)
 
     jobs = list(map(str, state.get("jobs", [])))
-    statuses = query_jobs(jobs)
+    # strict: a scheduler hiccup must raise, not read as "no inner job left" (= failed chain).
+    statuses = query_jobs(jobs, strict=True)
     if any(status.running for status in statuses.values()):
         return ChainStatus(chain_id, "running")
     if any(status.pending for status in statuses.values()):

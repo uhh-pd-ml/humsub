@@ -47,7 +47,7 @@ def _make_lineage(tmp_path: Path):
         "config": _config(tmp_path),
     }
     _write(sdir / "submission.json", spec)
-    _write(sdir / "law" / "control" / "slurm_jobs_0To6.json", {"jobs": {
+    _write(sdir / "law" / "control" / "hummel_jobs_0To6.json", {"jobs": {
         "1": {"job_id": "cA", "branches": [0, 1]},
         "2": {"job_id": "cB", "branches": [2, 3]},
         "3": {"job_id": "cC", "branches": [4, 5]},
@@ -61,6 +61,14 @@ STATES = {"cA": ChainStatus("cA", "finished", 0), "cB": ChainStatus("cB", "faile
 
 def test_chain_branch_map(tmp_path: Path) -> None:
     _, spec_path, _ = _make_lineage(tmp_path)
+    assert lineage.chain_branch_map(spec_path) == {"cA": [0, 1], "cB": [2, 3], "cC": [4, 5]}
+
+
+def test_chain_branch_map_reads_pre_hummel_workflow_control_files(tmp_path: Path) -> None:
+    """Submissions made before the "hummel" workflow type have law's job data in slurm_jobs_*.json."""
+    _, spec_path, _ = _make_lineage(tmp_path)
+    control = spec_path.parent / "law" / "control"
+    (control / "hummel_jobs_0To6.json").rename(control / "slurm_jobs_0To6.json")
     assert lineage.chain_branch_map(spec_path) == {"cA": [0, 1], "cB": [2, 3], "cC": [4, 5]}
 
 

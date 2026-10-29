@@ -63,3 +63,39 @@ class SlurmTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QueryJobsTests(unittest.TestCase):
+    """A scheduler hiccup must not look like "all jobs are gone" to callers that decide on it."""
+
+    @staticmethod
+    def _run(squeue_rc: int, sacct_rc: int):
+        import subprocess
+
+        def fake_run(cmd, **kwargs):
+            rc = squeue_rc if cmd[0].endswith("squeue") else sacct_rc
+            return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="slurm_load_jobs error: timeout")
+        return fake_run
+
+    def test_failing_scheduler_is_empty_by_default(self) -> None:
+        from unittest.mock import patch
+        from hummel_submit.slurm import query_jobs
+
+        with patch("hummel_submit.slurm.subprocess.run", side_effect=self._run(1, 1)):
+            self.assertEqual(query_jobs(["10"]), {})
+
+    def test_failing_sacct_raises_when_strict(self) -> None:
+        from unittest.mock import patch
+        from hummel_submit.slurm import SlurmError, query_jobs
+
+        with patch("hummel_submit.slurm.subprocess.run", side_effect=self._run(1, 1)):
+            with self.assertRaises(SlurmError):
+                query_jobs(["10"], strict=True)
+
+    def test_expired_job_unknown_to_squeue_is_not_an_error_when_strict(self) -> None:
+        from unittest.mock import patch
+        from hummel_submit.slurm import query_jobs
+
+        # squeue rejects an expired single job id; sacct answers (here: nothing known).
+        with patch("hummel_submit.slurm.subprocess.run", side_effect=self._run(1, 0)):
+            self.assertEqual(query_jobs(["10"], strict=True), {})
