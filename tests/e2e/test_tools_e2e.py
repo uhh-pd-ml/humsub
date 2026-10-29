@@ -38,9 +38,10 @@ def test_doctor_reports_an_unusable_location_and_exits_nonzero(project):
 def test_stats_and_prune_after_two_runs(project):
     res = _results(project)
     payload = project.write_payload("""
-        import json, sys
+        import json, sys, time
         from pathlib import Path
         ctx = json.loads(Path(sys.argv[1]).read_text())
+        time.sleep(2)              # measurable runtime for the stats assertions (sacct has 1 s resolution)
         Path(ctx["outputs"][0]).write_text(ctx["run_name"])
     """)
     runs = {}

@@ -45,6 +45,17 @@ def test_summary_numbers() -> None:
     assert abs(s["queue_wait_hours"]["max"] - 0.5) < 1e-9
 
 
+def test_a_job_shorter_than_a_second_ran_but_a_cancelled_pending_follower_did_not() -> None:
+    # sacct reports Elapsed in whole seconds, so a very short job shows 00:00:00.
+    rows = parse_sacct("""\
+200|e2e|COMPLETED|2026-10-09T10:00:00|2026-10-09T10:00:01|2026-10-09T10:00:01|00:00:00|0:0|1|std
+201|e2e|CANCELLED by 1|2026-10-09T10:00:00|2026-10-09T10:00:01|2026-10-09T10:00:01|00:00:00|0:0|1|std
+""")
+    s = summarize(rows)
+    assert s["ran_jobs"] == 1
+    assert s["peak_concurrency"] == 1
+
+
 def test_report_lines_mention_the_headline_numbers() -> None:
     text = "\n".join(format_stats(summarize(parse_sacct(SACCT), {"c1": 1, "c2": 2}, "das-ntuple-supervisor")))
     for needle in ("5 (", "2 COMPLETED", "median 1.75 h", "core-hours", "peak running:  3", "chains:        2", "102 FAILED after 30 s"):
