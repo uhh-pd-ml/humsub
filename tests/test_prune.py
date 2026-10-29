@@ -114,7 +114,7 @@ def test_active_submissions_are_refused_unless_forced(tmp_path: Path, capsys) ->
     import hummel_submit.chain as chain
     from hummel_submit.slurm import SlurmJobStatus
     orig = chain.query_jobs
-    chain.query_jobs = lambda ids: {i: SlurmJobStatus(i, "RUNNING") for i in ids}
+    chain.query_jobs = lambda ids, **kw: {i: SlurmJobStatus(i, "RUNNING") for i in ids}
     try:
         assert e.run("--run", "live", "--apply") == 1
         assert "REFUSED" in capsys.readouterr().out

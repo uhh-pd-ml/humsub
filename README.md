@@ -421,7 +421,8 @@ humsub submit-manifest
         runs the law job script; on SIGUSR1 (signal_seconds before the limit) it writes continue-<hop>,
         SIGTERMs the payload group and exits 0; a follower queued with `afterany` starts the next hop
         only if that marker exists; on success/failure the follower is cancelled
-  → law sees only the stable chain id (pending / running / finished / failed)
+  → law sees only the stable chain id (pending / running / finished / failed); a failing squeue/sacct is
+    retried and reported as an error, never as a failed chain
 ```
 
 Each chain stores a ZIP snapshot of the worker code, so upgrading the package cannot change a running

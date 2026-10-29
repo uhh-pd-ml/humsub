@@ -178,8 +178,13 @@ def parse_sacct_status(text: str, requested: set[str] | None = None) -> dict[str
     return result
 
 
-def query_jobs(job_ids: list[str]) -> dict[str, SlurmJobStatus]:
-    """Query current and accounting state for top-level Slurm jobs."""
+def query_jobs(job_ids: list[str], *, strict: bool = False) -> dict[str, SlurmJobStatus]:
+    """Query current and accounting state for top-level Slurm jobs.
+
+    Jobs that neither squeue nor sacct know are absent from the result.  With *strict*, a failing
+    sacct (needed for every job squeue did not report) raises :class:`SlurmError` instead, so a
+    scheduler hiccup is not mistaken for "these jobs are gone".
+    """
     if not job_ids:
         return {}
 
@@ -212,10 +217,12 @@ def query_jobs(job_ids: list[str]) -> dict[str, SlurmJobStatus]:
             check=False,
             text=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
         if sacct.returncode == 0:
             result.update(parse_sacct_status(sacct.stdout, requested=missing))
+        elif strict:
+            raise SlurmError(f"sacct failed with exit code {sacct.returncode}: {sacct.stderr.strip()}")
 
     return result
 

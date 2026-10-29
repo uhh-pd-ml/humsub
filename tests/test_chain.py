@@ -51,6 +51,17 @@ class ChainStatusTests(unittest.TestCase):
             self.assertEqual(status.state, "failed")
             self.assertEqual(status.code, 17)
 
+    def test_scheduler_hiccup_raises_instead_of_failing_the_chain(self) -> None:
+        from hummel_submit.slurm import SlurmError
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._state(root, "running-hop-1", ["10"])
+            with patch("hummel_submit.chain.query_jobs", side_effect=SlurmError("sacct failed")) as query:
+                with self.assertRaises(SlurmError):
+                    query_chain(root, "chain-test")
+            query.assert_called_once_with(["10"], strict=True)
+
 
 if __name__ == "__main__":
     unittest.main()
