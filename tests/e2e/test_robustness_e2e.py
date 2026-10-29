@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from .conftest import sacct_states, squeue
+from .conftest import sacct_states
 
 
 def _job_ids(project, chain: str) -> list[str]:
@@ -294,7 +294,7 @@ def test_supervisor_job_resumes_missing_branches_without_a_controller(project):
     deadline = time.time() + 420
     while not out.exists() and time.time() < deadline:
         time.sleep(5)
-    assert out.exists(), f"supervisor did not resume the branch\n{squeue()}\n{_logs(project)[-2000:]}"
+    assert out.exists(), f"supervisor did not resume the branch\n{project.squeue()}\n{_logs(project)[-2000:]}"
     assert out.read_text() == "sup-resume1"
     time.sleep(90)  # the supervisor verifies once more and ends
     summary = project.humsub("submission-status", sub.id, check=True).stdout

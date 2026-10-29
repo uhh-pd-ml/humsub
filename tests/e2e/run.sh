@@ -6,14 +6,19 @@
 #   tests/e2e/run.sh -m slow              only the slow ones (minutes: real time limits)
 #   tests/e2e/run.sh -k roundtrip -x      any pytest arguments
 #
+# Tests run in parallel (pytest-xdist, E2E_WORKERS workers); every test submits under its own
+# Slurm job name, so tests only see and cancel their own jobs.
+#
 # Environment:
 #   IMAGE            image to use (default ghcr.io/uhh-pd-ml/hummel-slurm-ci:latest)
-#   WHEELHOUSE       directory of wheels (law, luigi, pytest, setuptools, wheel and
+#   WHEELHOUSE       directory of wheels (law, luigi, pytest, pytest-xdist, setuptools, wheel and
 #                    their dependencies); installs offline from it instead of from
 #                    the network.  If unset, one is built on the *host* (which has network)
 #                    into ${XDG_CACHE_HOME:-~/.cache}/humsub-e2e-wheelhouse-<law commit> on first
 #                    use and re-used afterwards -- containers usually have no working DNS.
 #                    NO_WHEELHOUSE=1 installs from the network inside the container instead.
+#   E2E_WORKERS      parallel pytest workers (default 4; 0 = serial).  The simulated cluster has
+#                    16 CPUs in `std`; many more workers make hops queue and slow tests time out.
 #   DOCKER_RUN_FLAGS extra `docker run` flags, e.g. --cpus=2 to mimic a small CI runner
 #   KEEP_CONTAINER=1 leave the container running afterwards (docker exec -u testuser ...)
 #   COVERAGE=1       measure coverage of hummel_submit in *all* processes (law, chain
@@ -34,10 +39,13 @@ LAW_REQ=$(sed -n 's/^ *"\(law @ [^"]*\)",*$/\1/p' pyproject.toml)
 [ -n "$LAW_REQ" ] || { echo "no law requirement found in pyproject.toml"; exit 1; }
 if [ -z "${WHEELHOUSE:-}" ] && [ "${NO_WHEELHOUSE:-0}" != 1 ]; then
     WHEELHOUSE="${XDG_CACHE_HOME:-$HOME/.cache}/humsub-e2e-wheelhouse-${LAW_REQ##*@}"
-    if [ -z "$(ls -A "$WHEELHOUSE" 2>/dev/null)" ]; then
-        echo "building the wheelhouse in $WHEELHOUSE (once) ..."
+    WHEELS=("$LAW_REQ" pytest pytest-xdist setuptools wheel coverage)
+    # (re)build when the wanted set changed, e.g. after adding a test dependency
+    if [ "$(cat "$WHEELHOUSE/.requirements" 2>/dev/null)" != "${WHEELS[*]}" ]; then
+        echo "building the wheelhouse in $WHEELHOUSE ..."
         mkdir -p "$WHEELHOUSE"
-        python3 -m pip wheel -q -w "$WHEELHOUSE" "$LAW_REQ" pytest setuptools wheel coverage
+        python3 -m pip wheel -q -w "$WHEELHOUSE" "${WHEELS[@]}"
+        echo "${WHEELS[*]}" > "$WHEELHOUSE/.requirements"
     fi
 fi
 NAME="${CONTAINER_NAME:-humsub-e2e}"
@@ -64,17 +72,17 @@ docker exec "$NAME" test -e /run/hummel-ready || { docker logs --tail 40 "$NAME"
 # pytest arguments are passed through a file to survive quoting
 printf '%s\0' "$@" | docker exec -i "$NAME" bash -c 'cat > /tmp/pytest-args'
 
-docker exec -u testuser -w /beegfs/uu/testuser/testuser -e WHEELHOUSE="${WHEELHOUSE:+/wheelhouse}" -e COVERAGE="${COVERAGE:-0}" "$NAME" bash -lc '
+docker exec -u testuser -w /beegfs/uu/testuser/testuser -e WHEELHOUSE="${WHEELHOUSE:+/wheelhouse}" -e COVERAGE="${COVERAGE:-0}" -e E2E_WORKERS="${E2E_WORKERS:-4}" "$NAME" bash -lc '
 set -euo pipefail
 V=$USW/venv
 python3.12 -m venv "$V"
 if [ -n "${WHEELHOUSE:-}" ]; then
     pipopts=(--no-index --find-links "$WHEELHOUSE")
-    "$V/bin/pip" install -q "${pipopts[@]}" setuptools wheel law pytest
+    "$V/bin/pip" install -q "${pipopts[@]}" setuptools wheel law pytest pytest-xdist
     pipopts+=(--no-build-isolation --no-deps)
 else
     pipopts=()
-    "$V/bin/pip" install -q pytest
+    "$V/bin/pip" install -q pytest pytest-xdist
 fi
 # build from a writable copy: /src is mounted read-only
 rm -rf "$BEEGFS/src" && mkdir "$BEEGFS/src"
@@ -84,6 +92,7 @@ rm -rf "$BEEGFS/tests" && cp -r /src/tests "$BEEGFS/tests"
 cd "$BEEGFS"
 mapfile -d "" args < /tmp/pytest-args
 if [ ${#args[@]} -eq 0 ]; then args=(-m "not slow"); fi
+if [ "$E2E_WORKERS" != 0 ]; then args=(-n "$E2E_WORKERS" "${args[@]}"); fi
 export HUMSUB_E2E=1 PATH="$V/bin:$PATH"
 target=tests/e2e
 if [ "${COVERAGE:-0}" = 1 ]; then

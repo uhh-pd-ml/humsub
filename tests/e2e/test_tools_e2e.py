@@ -60,7 +60,7 @@ def test_stats_and_prune_after_two_runs(project):
     assert "core-hours" in text and "peak running" in text
 
     chains = json.loads((project.out / ".hummel-submit" / "chains" / sub.chains[0] / "state.json").read_text())["jobs"]
-    logs = lambda ids: [project.out / "logs" / f"e2e_{j}.log" for j in ids]
+    logs = lambda ids: [project.out / "logs" / f"{project.job_name}_{j}.log" for j in ids]
     keep_chains = json.loads((project.out / ".hummel-submit" / "chains" / runs["keep"][0].chains[0] / "state.json").read_text())["jobs"]
     existing = lambda ids: [p for p in logs(ids) if p.exists()]       # a cancelled follower never wrote a log
     assert existing(chains), "the job ran and wrote a log"
