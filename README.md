@@ -461,24 +461,15 @@ are checked for writability before submission.  Per-submission overrides: `--tim
 ## Development
 
 ```bash
-pip install pytest && PYTHONPATH=src python -m pytest -q        # scheduler-independent unit tests
+pip install -e . pytest && python -m pytest -q tests     # unit tests, no cluster needed
+tests/e2e/run.sh -m "slow or not slow"                   # all end-to-end tests against a real Slurm (Docker)
 ```
 
-A real end-to-end test needs Slurm: run `examples/hello/run.sh` on a frontend.
+The end-to-end tests run in the Docker image from [hummel-slurm-ci](https://github.com/uhh-pd-ml/hummel-slurm-ci),
+a Slurm configured like Hummel-2, and submit real manifests, chains, failures, cancellations and pre-timeout
+continuations; on a real frontend, `examples/hello/run.sh` is a quick check.  See [CONTRIBUTING.md](CONTRIBUTING.md)
+for the test options, how to write parallel-safe e2e tests, compatibility rules and how to move to a newer law.
 
-## Tests
+## License
 
-```bash
-python -m pytest tests --ignore=tests/e2e     # unit tests, no cluster needed
-tests/e2e/run.sh                              # end-to-end against a real Slurm configured like Hummel-2
-tests/e2e/run.sh -m slow                      # also the slow ones (real time limits, ~1 min)
-```
-
-The end-to-end tests run inside the Docker image from
-[hummel-slurm-ci](https://github.com/uhh-pd-ml/hummel-slurm-ci) (Slurm 24.11 with Hummel's partitions,
-accounts, submit filter and `/sw/batch/init.sh`); they submit real manifests, chains, failures,
-cancellations and a pre-timeout continuation.  Set `WHEELHOUSE=dir` to install from local wheels when the
-container has no network.  Without `WHEELHOUSE`, `run.sh` builds a wheelhouse on the *host* once
-(`~/.cache/humsub-e2e-wheelhouse`, needs `pip` and network) because the container usually has no working DNS; `NO_WHEELHOUSE=1`
-installs from the network inside the container instead.  `IMAGE=` selects the image; by default a locally available `hummel-slurm-ci:latest`
-is used, else the one on ghcr.io.  A full run (unit + e2e incl. slow tests) takes about 15 minutes.
+humsub is licensed under the [BSD 3-Clause License](LICENSE).
