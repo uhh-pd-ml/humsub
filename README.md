@@ -38,7 +38,7 @@ Needs Python ≥ 3.11 and `rsync` (present on Hummel).  Install software under `
 
 ```bash
 python3 -m venv "$USW/venvs/hummel-submit"
-"$USW/venvs/hummel-submit/bin/pip" install .          # also installs law (master branch) from GitHub
+"$USW/venvs/hummel-submit/bin/pip" install .          # also installs law (pinned commit, see pyproject.toml) from GitHub
 mkdir -p "$HOME/.local/bin"
 ln -sf "$USW/venvs/hummel-submit/bin/humsub" "$HOME/.local/bin/humsub"
 humsub --version
@@ -429,6 +429,26 @@ Each chain stores a ZIP snapshot of the worker code, so upgrading the package ca
 chain.  law and the chain run in the Hummel host environment; the payload decides about containers.
 Custom law workflows can inherit `hummel_submit.contrib.hummel.HummelWorkflow` directly; independent
 branches should prefer manifest mode.  The law integration is isolated in `hummel_submit/contrib/hummel`.
+
+`HummelWorkflow` is its own law workflow type, `hummel` (since 0.5; before it was a `SlurmWorkflow`).  Its hooks
+are named `hummel_*` and mirror law's `slurm_*` hooks where they make sense for chains, so one task can offer
+several backends and pick one with `--workflow`:
+
+```python
+class MyTask(HummelWorkflow, law.slurm.SlurmWorkflow, law.LocalWorkflow):
+    ...  # --workflow hummel | slurm | local
+```
+
+law's `slurm_*` parameters and `[job] slurm_*` options do not apply to `hummel`; account, partition and time limit
+come from the humsub configuration.  `HummelJobManager` retries failed scheduler interactions (submit, status query,
+cancel) like law's own managers; the defaults come from law's `[job]` config section:
+
+```ini
+[job]
+hummel_manager_threads: 4
+hummel_manager_retries: 1
+hummel_manager_retry_delay: 5
+```
 
 ## Single-command mode
 

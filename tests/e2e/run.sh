@@ -11,8 +11,8 @@
 #   WHEELHOUSE       directory of wheels (law, luigi, pytest, setuptools, wheel and
 #                    their dependencies); installs offline from it instead of from
 #                    the network.  If unset, one is built on the *host* (which has network)
-#                    into ${XDG_CACHE_HOME:-~/.cache}/humsub-e2e-wheelhouse on first use and
-#                    re-used afterwards -- containers usually have no working DNS.
+#                    into ${XDG_CACHE_HOME:-~/.cache}/humsub-e2e-wheelhouse-<law commit> on first
+#                    use and re-used afterwards -- containers usually have no working DNS.
 #                    NO_WHEELHOUSE=1 installs from the network inside the container instead.
 #   DOCKER_RUN_FLAGS extra `docker run` flags, e.g. --cpus=2 to mimic a small CI runner
 #   KEEP_CONTAINER=1 leave the container running afterwards (docker exec -u testuser ...)
@@ -29,12 +29,15 @@ if [ -z "${IMAGE:-}" ]; then
     else IMAGE=ghcr.io/uhh-pd-ml/hummel-slurm-ci:latest; fi
 fi
 # the wheelhouse: build it on the host once (see above)
+# law exactly as pinned in pyproject.toml; the wheelhouse is keyed by the pinned commit
+LAW_REQ=$(sed -n 's/^ *"\(law @ [^"]*\)",*$/\1/p' pyproject.toml)
+[ -n "$LAW_REQ" ] || { echo "no law requirement found in pyproject.toml"; exit 1; }
 if [ -z "${WHEELHOUSE:-}" ] && [ "${NO_WHEELHOUSE:-0}" != 1 ]; then
-    WHEELHOUSE="${XDG_CACHE_HOME:-$HOME/.cache}/humsub-e2e-wheelhouse"
+    WHEELHOUSE="${XDG_CACHE_HOME:-$HOME/.cache}/humsub-e2e-wheelhouse-${LAW_REQ##*@}"
     if [ -z "$(ls -A "$WHEELHOUSE" 2>/dev/null)" ]; then
         echo "building the wheelhouse in $WHEELHOUSE (once) ..."
         mkdir -p "$WHEELHOUSE"
-        python3 -m pip wheel -q -w "$WHEELHOUSE" "law @ git+https://github.com/riga/law.git@master" pytest setuptools wheel coverage
+        python3 -m pip wheel -q -w "$WHEELHOUSE" "$LAW_REQ" pytest setuptools wheel coverage
     fi
 fi
 NAME="${CONTAINER_NAME:-humsub-e2e}"
