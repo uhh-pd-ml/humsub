@@ -314,7 +314,7 @@ humsub submit-manifest --manifest M --payload P|builtin:container [--stage N=PAT
         [--no-resubmit] [--time T] [--account A] [--partition P] [--reservation R] [--mail M]
         [--max-hops H] [--nice N] [--signal-seconds S] [--grace-seconds G] [--sbatch-arg ARG]… [--skip-path-checks]
         [--retry-payload N | --safety-margin F] [--max-concurrent N] [--scratch beegfs|ssd]
-        [--supervisor-job [--supervisor-interval S] [--supervisor-rounds R]] [--ignore-quota-check]
+        [--supervisor-job [--supervisor-interval S] [--supervisor-trigger-delay S] [--supervisor-rounds R]] [--ignore-quota-check]
 humsub resume SUBMISSION [--dry-run] [--retries R] [--parallel-jobs J] [--stage N=PATH]… [--supervisor-job]
         [--time T] [--account A] [--partition P] [--max-hops H] [--nice N] [--sbatch-arg ARG]…   continue after a give-up
 humsub tick SUBMISSION                         one law pass: poll once, resubmit failed jobs, submit what is ready
@@ -418,7 +418,14 @@ Inside a job (1, 2) and across jobs (3, 4); choose what fits, you do not need al
    default `--supervisor-rounds` = 3; counted across passes from law's jobs file), submits jobs still waiting for
    `--parallel-jobs` room, and runs every task whose requirements are complete (e.g. the manifest's `finalize`
    workflow).  It stops when the top task is complete and gives up when law reports jobs that failed with no retries
-   left.  `humsub tick SUBMISSION` runs one pass by hand (the control lock, below, keeps passes from overlapping).  The supervisor is
+   left.  `humsub tick SUBMISSION` runs one pass by hand (the control lock, below, keeps passes from overlapping).
+   **Chain ends bring passes forward:** when a chain ends (completed, failed, out of hops), its worker brings the pending
+   supervisor job forward to start `--supervisor-trigger-delay` seconds later (default 60, gathering many chain ends into
+   one pass; never later than planned), so a finalize step or a retry follows within a minute or two rather than after a
+   whole interval.  If a supervisor is running a pass at that moment, the worker leaves a marker
+   (`<submission>/pass-requested`) instead, and that supervisor queues its successor after the trigger delay.  The
+   interval stays as the heartbeat for chains that end without running any code (node failure, SIGKILL), so it can be
+   long.  The supervisor is
    never niced (a niced watchdog starves on a busy partition).  `scrontab` is disabled on Hummel-2, so this is the cron
    substitute inside the cluster; `humsub tick` from your own cron works as well.
 4. **`--wait --retries R`** (controller based): law keeps polling and resubmits failed branches while the
@@ -431,7 +438,8 @@ schedule must hold it: the supervisor job (from its start to its end, including 
 `humsub resume` and `submit-manifest` while it queues the first supervisor.  Supervisor jobs can only be queued under
 it, so a supervisor is only ever queued by the running supervisor itself or while none runs; a supervisor that finds
 another supervisor holding the lock ends at once **without** a successor, so two lines of supervisors can never form.
-A supervisor that finds a `tick`/`resume` holding it waits (up to 20 minutes); `tick` reports `busy`, `resume` refuses.
+A supervisor that finds a `tick`/`resume` holding it waits (up to 20 minutes); `tick` reports `busy`, `resume` refuses.  A chain
+whose end requests a pass changes the supervisor schedule only if it gets the lock, otherwise it leaves the marker.
 
 * **Across nodes.**  On Hummel-2's BeeGFS `flock` is node-local (a compute node acquires a lock the login node holds),
   so the lock is the *existence* of the file, created with `O_EXCL`, which BeeGFS makes atomic cluster-wide.  The file
@@ -441,6 +449,10 @@ A supervisor that finds a `tick`/`resume` holding it waits (up to 20 minutes); `
   without the owner: a Slurm job that Slurm no longer lists (if Slurm cannot be asked, the lock counts as alive), a
   process on the same host whose pid is gone, or any lock not refreshed for 10 minutes (the holder touches it every
   minute).  A stale lock is broken by an atomic rename, so two processes cannot both break it and both own it.
+* **Short critical sections use the same principle.**  Read-modify-write of `submission.json` and of a chain's
+  `state.json`, and chain creation, are protected by short-held `O_EXCL` mutexes (`.submission.mutex`, `.state.mutex`,
+  `.submit-chain.mutex`; broken when older than 60 s, chain creation 5 min), so a worker on a compute node and a
+  command on the login node cannot lose each other's updates.
 
 #### In-chain retries (`--safety-margin`) versus law retries (`--retries`)
 

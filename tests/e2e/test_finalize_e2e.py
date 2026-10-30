@@ -114,3 +114,17 @@ def test_failed_finalize_gives_up_and_resume_retries_it(project):
     assert "supervisor queued again" in resumed.stdout, resumed.stdout
     _wait_for(res / "sum.txt", 150, project, "resume did not resubmit the finalize workflow")
     assert (res / "sum.txt").read_text() == "11"
+
+
+@pytest.mark.supervisor
+def test_chain_ends_bring_the_next_pass_forward(project):
+    """With a half-hour interval nothing would happen for 30 minutes: the ends of the branches bring the pass that
+    submits finalize forward, the end of the finalize chain the pass that ends supervision."""
+    manifest, payload, res = _setup(project, 2)
+    sub = project.submit(manifest, payload, "trigger", "--supervisor-interval", "1800",
+                         "--supervisor-trigger-delay", SUPERVISOR_INTERVAL)
+    assert sub.proc.returncode == 0, sub.text
+    _wait_for(res / "sum.txt", 300, project, "no pass was triggered by the ends of the branches")
+    assert (res / "sum.txt").read_text() == "11"
+    logs = project.wait_for_log("pass complete -> done", 300)
+    assert "chain ended; pass requested: supervisor job" in logs and "brought forward" in logs, logs[-3000:]

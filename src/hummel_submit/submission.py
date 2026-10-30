@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import fcntl
 import getpass
 import json
 import os
@@ -180,15 +179,7 @@ def load_submission_spec(path: Path) -> dict[str, Any]:
 
 
 def append_submission_chain(path: Path, chain_id: str) -> dict[str, Any]:
-    lock_path = path.parent / ".submission.lock"
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        data = load_submission_spec(path)
-        if chain_id not in data["chain_ids"]:
-            data["chain_ids"].append(chain_id)
-        atomic_write_json(path, data)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    return data
+    return append_spec_list(path, "chain_ids", chain_id)
 
 
 def append_spec_list(path: Path, key: str, value: Any) -> dict[str, Any]:
@@ -202,12 +193,11 @@ def append_spec_list(path: Path, key: str, value: Any) -> dict[str, Any]:
 
 
 def update_submission_spec(path: Path, change: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
-    """Apply *change* to the submission spec in place, under the submission lock."""
-    lock_path = path.parent / ".submission.lock"
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    """Apply *change* to the submission spec in place, under its cross-node mutex (flock is node-local on BeeGFS)."""
+    from .locks import mutex
+
+    with mutex(Path(path).parent / ".submission.mutex"):
         data = load_submission_spec(path)
         change(data)
         atomic_write_json(path, data)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     return data

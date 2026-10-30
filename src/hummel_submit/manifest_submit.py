@@ -54,6 +54,7 @@ class SubmitOptions:
     scratch: str | None = None
     supervisor_job: bool = False
     supervisor_interval: int = 1800
+    supervisor_trigger_delay: int = 60      # a chain's end brings the next pass forward to this many seconds
     supervisor_max_rounds: int = 3
     ignore_quota_check: bool = False
 
@@ -82,6 +83,8 @@ class SubmitOptions:
         floor = min_supervisor_interval()
         if self.supervisor_job and (self.supervisor_interval < floor or self.supervisor_max_rounds < 1):
             raise ConfigError(f"--supervisor-interval must be >= {floor} s and --supervisor-rounds >= 1")
+        if self.supervisor_job and self.supervisor_trigger_delay < floor:
+            raise ConfigError(f"--supervisor-trigger-delay must be >= {floor} s")
 
     def law_retries(self) -> int:
         """law's resubmissions per failed job.  The supervisor's passes let law retry (``--supervisor-rounds`` times
@@ -151,7 +154,8 @@ def describe_policy(config: dict[str, Any], opts: SubmitOptions, scratch_kind: s
         driver = "the waiting controller" if opts.wait else "the supervisor's law passes"
         lines.append(f"[submit] retry       law resubmits a failed job up to {retries}x ({driver})")
     if opts.supervisor_job:
-        lines.append(f"[submit] supervisor  a law pass every {opts.supervisor_interval}s until done (or no retries left)")
+        lines.append(f"[submit] supervisor  a law pass every {opts.supervisor_interval}s until done (or no retries left); "
+                     f"a chain's end brings the next one forward to {min(opts.supervisor_trigger_delay, opts.supervisor_interval)}s")
     return lines
 
 

@@ -15,6 +15,9 @@ decided without the owner:
 
 A stale lock is broken by an atomic rename to a unique name, so two processes cannot both break it and both believe
 they own it.  The lock is re-entrant for its owner (same Slurm job, or same host and pid).
+
+:func:`mutex` is the same principle for short critical sections (read-modify-write of submission.json and of a chain's
+state.json, chain creation), which therefore also exclude each other across nodes.
 """
 from __future__ import annotations
 
@@ -92,6 +95,63 @@ def read_holder(path: Path) -> tuple[dict[str, Any], float] | None:
         return {"purpose": "starting"}, time.time()
 
 
+def break_stale(path: Path, stale: dict[str, Any]) -> None:
+    """Move a stale lock file aside; only one breaker wins the rename.  If the lock was released and taken by a live
+    owner between the staleness check and the rename, put it back (``link`` never overwrites a lock created meanwhile)."""
+    aside = path.with_name(f"{path.name}.stale-{uuid.uuid4().hex[:8]}")
+    try:
+        os.rename(path, aside)
+    except FileNotFoundError:
+        return
+    moved = read_holder(aside)
+    if moved and moved[0].get("token") != stale.get("token"):
+        try:
+            os.link(aside, path)
+        except FileExistsError:
+            pass
+    aside.unlink(missing_ok=True)
+
+
+#: A short-held mutex older than this is the leftover of a holder that was killed inside its critical section.
+MUTEX_STALE_SECONDS = 60
+
+
+@contextmanager
+def mutex(path: Path, *, timeout: float = 120, stale: float = MUTEX_STALE_SECONDS) -> Iterator[None]:
+    """Cross-node mutual exclusion for *short* critical sections (read-modify-write of a JSON file): the same O_EXCL
+    principle as the control lock, without a refresh thread; a lock file older than MUTEX_STALE_SECONDS is broken.
+    Not re-entrant.  Raises TimeoutError after *timeout* seconds of waiting."""
+    path = Path(path)
+    owner = me("mutex")
+    deadline = time.time() + timeout
+    delay = 0.02
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o664)
+        except FileExistsError:
+            found = read_holder(path)
+            if found is None:
+                continue
+            holder, mtime = found
+            if time.time() - mtime > stale:
+                break_stale(path, holder)
+                continue
+            if time.time() > deadline:
+                raise TimeoutError(f"{path} has been held for more than {timeout:.0f} s ({describe(holder)})")
+            time.sleep(delay)
+            delay = min(delay * 2, 0.5)
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(owner, handle)
+        break
+    try:
+        yield
+    finally:
+        found = read_holder(path)
+        if found and same_owner(found[0], owner):
+            path.unlink(missing_ok=True)
+
+
 class ControlLock:
     """``with ControlLock(submission_dir, "supervisor pass"):`` - see the module docstring."""
 
@@ -133,20 +193,7 @@ class ControlLock:
         return True
 
     def _break(self, stale: dict[str, Any]) -> None:
-        """Move a stale lock aside; only one breaker wins the rename.  If the lock was released and taken by a live
-        owner between our check and the rename, put it back (``link`` never overwrites a lock created meanwhile)."""
-        aside = self.path.with_name(f"{LOCK_NAME}.stale-{uuid.uuid4().hex[:8]}")
-        try:
-            os.rename(self.path, aside)
-        except FileNotFoundError:
-            return
-        moved = read_holder(aside)
-        if moved and moved[0].get("token") != stale.get("token"):
-            try:
-                os.link(aside, self.path)
-            except FileExistsError:
-                pass
-        aside.unlink(missing_ok=True)
+        break_stale(self.path, stale)
 
     def acquire(self, *, wait: float = 0, poll: float = 5) -> None:
         deadline = time.time() + wait

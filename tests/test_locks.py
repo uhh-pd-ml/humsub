@@ -130,3 +130,41 @@ def test_supervisor_releases_the_lock_when_its_pass_fails(tmp_path: Path) -> Non
         with pytest.raises(RuntimeError, match="boom"):
             supervisor.main([str(spec_path), "1:1"])
     assert not (tmp_path / LOCK_NAME).exists()
+
+
+# --- the short-held mutex ------------------------------------------------------------------------------------------
+
+def _bump(state_path: str, times: int) -> None:
+    from hummel_submit.state import _locked_update
+
+    for _ in range(times):
+        _locked_update(Path(state_path), lambda data: data.update(n=data["n"] + 1))
+
+
+def test_mutex_loses_no_update_between_processes(tmp_path: Path) -> None:
+    import multiprocessing
+
+    state_path = tmp_path / "chain" / "state.json"
+    state_path.parent.mkdir()
+    state_path.write_text(json.dumps({"n": 0}))
+    ctx = multiprocessing.get_context("spawn")
+    procs = [ctx.Process(target=_bump, args=(str(state_path), 25)) for _ in range(4)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(120)
+    assert json.loads(state_path.read_text())["n"] == 100
+    assert not (state_path.parent / ".state.mutex").exists()
+
+
+def test_mutex_waits_for_a_live_holder_and_breaks_a_stale_one(tmp_path: Path) -> None:
+    path = tmp_path / ".x.mutex"
+    path.write_text(json.dumps({"token": "other", "purpose": "mutex", "host": "elsewhere", "pid": 1}))
+    with pytest.raises(TimeoutError, match="held for more than"):
+        with locks.mutex(path, timeout=0.3):
+            pass
+    old = time.time() - locks.MUTEX_STALE_SECONDS - 5
+    os.utime(path, (old, old))                       # its holder was killed inside the critical section
+    with locks.mutex(path, timeout=5):
+        assert json.loads(path.read_text())["token"] != "other"
+    assert not path.exists()

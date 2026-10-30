@@ -106,6 +106,9 @@ def _add_manifest_policy_options(parser: argparse.ArgumentParser) -> None:
                              "submits what is ready; no login-node process)")
     parser.add_argument("--supervisor-interval", type=int, default=None, metavar="SECONDS",
                         help="seconds between supervisor passes (default 1800)")
+    parser.add_argument("--supervisor-trigger-delay", type=int, default=None, metavar="SECONDS",
+                        help="a chain that ends brings the next supervisor pass forward to this many seconds later "
+                             "(default 60: gathers the ends of many chains into one pass)")
     parser.add_argument("--supervisor-rounds", type=int, default=None, metavar="R",
                         help="law retries per failed job when the supervisor runs and --retries is not given (default 3)")
     parser.add_argument("--ignore-quota-check", action="store_true", default=None,
@@ -120,6 +123,7 @@ def _option_overrides(args: argparse.Namespace) -> dict[str, Any]:
         "scratch": "scratch",
         "supervisor_job": "supervisor_job",
         "supervisor_interval": "supervisor_interval",
+        "supervisor_trigger_delay": "supervisor_trigger_delay",
         "supervisor_rounds": "supervisor_max_rounds",
         "ignore_quota_check": "ignore_quota_check",
         "tasks_per_job": "tasks_per_job",

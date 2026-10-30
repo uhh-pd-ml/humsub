@@ -19,6 +19,7 @@ import time
 from .locks import ControlLock, LockBusy, describe, held_here
 from .overview import compute_overview, finalize_state, format_overview
 from .tick import run_tick
+from .trigger import consume_marker, requested_since, trigger_delay
 from .slurm import SlurmError, slurm_command
 from .state import write_worker_snapshot
 from .submission import append_spec_list, load_submission_spec
@@ -35,7 +36,7 @@ def log(message: str) -> None:
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [supervisor:{os.environ.get('SLURM_JOB_ID', 'local')}] {message}", flush=True)
 
 
-def supervisor_command(spec_path: Path, round_no: int, checks: int = 1) -> list[str]:
+def supervisor_command(spec_path: Path, round_no: int, checks: int = 1, delay: int | None = None) -> list[str]:
     spec = load_submission_spec(spec_path)
     opts = spec.get("submit_options", {})
     slurm = spec["config"]["slurm"]
@@ -49,7 +50,7 @@ def supervisor_command(spec_path: Path, round_no: int, checks: int = 1) -> list[
     if not script.exists():
         script.write_text((package_dir / "supervisor.sh").read_text(encoding="utf-8"), encoding="utf-8")
         script.chmod(0o755)
-    interval = int(opts.get("supervisor_interval", 1800))
+    interval = int(opts.get("supervisor_interval", 1800)) if delay is None else delay
     args = [
         slurm_command("sbatch"),
         "--parsable",
@@ -71,12 +72,12 @@ def supervisor_command(spec_path: Path, round_no: int, checks: int = 1) -> list[
     return args
 
 
-def submit_supervisor(spec_path: Path, round_no: int, checks: int = 1) -> str:
+def submit_supervisor(spec_path: Path, round_no: int, checks: int = 1, delay: int | None = None) -> str:
     """Queue a supervisor job; only allowed while holding the submission's control lock, so a supervisor can only ever
     be queued by the running supervisor itself, or by a submit/resume while no supervisor runs."""
     if not held_here(spec_path):
         raise RuntimeError("internal error: a supervisor may only be queued while holding the submission's control lock")
-    cmd = supervisor_command(spec_path, round_no, checks)
+    cmd = supervisor_command(spec_path, round_no, checks, delay)
     try:
         proc = subprocess.run(cmd, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except (OSError, subprocess.CalledProcessError) as exc:
@@ -146,6 +147,8 @@ def _supervise(spec_path: Path, round_no: int, checks: int) -> int:
     output_dir = Path(spec["output_dir"])
     log(f"submission {spec['submission_id']} (run {spec['run_name']}, project {spec.get('project_dir')})")
 
+    pass_start = time.time()
+    consume_marker(spec_path.parent, pass_start)     # this pass handles every chain that ended before it
     result = run_tick(spec_path, SUPERVISOR_PURPOSE)
     spec = load_submission_spec(spec_path)
     for line in format_overview(compute_overview(output_dir, spec), hint=False):
@@ -163,8 +166,15 @@ def _supervise(spec_path: Path, round_no: int, checks: int) -> int:
         log("giving up: law has no retries left (or too many checks); inspect with `humsub submission-status`, "
             f"fix the cause and run `humsub resume {spec['submission_id']}` (fresh retries, supervisor queued again)")
         return 1
-    job = submit_supervisor(spec_path, round_no, checks + 1)
-    log(f"queued next check as job {job}")
+    opts = spec.get("submit_options", {})
+    if requested_since(spec_path.parent, pass_start):
+        delay = trigger_delay(opts)
+        why = "a chain ended during this pass"
+    else:
+        delay = int(opts.get("supervisor_interval", 1800))
+        why = "the interval"
+    job = submit_supervisor(spec_path, round_no, checks + 1, delay)
+    log(f"queued next check as job {job}, in {delay} s ({why}; ending chains bring it forward)")
     return 0
 
 

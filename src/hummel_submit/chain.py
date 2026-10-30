@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-import fcntl
 from pathlib import Path
 import shutil
 
@@ -53,14 +52,13 @@ def lane_dependency(spec: dict[str, object]) -> str | None:
 
 @contextlib.contextmanager
 def _submission_lock(submission_spec_path: Path):
-    """Serialise chain creation: law submits from several threads, but lane assignment
-    (``--max-concurrent``) must see every previously created chain."""
-    with (submission_spec_path.parent / ".submit-chain.lock").open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    """Serialise chain creation: law submits from several threads (and a pass may run while a `resume` or `tick` waits),
+    but lane assignment (``--max-concurrent``) must see every previously created chain.  Cross-node mutex; the critical
+    section includes an sbatch, so a holder counts as stale only after 5 minutes."""
+    from .locks import mutex
+
+    with mutex(submission_spec_path.parent / ".submit-chain.mutex", timeout=600, stale=300):
+        yield
 
 
 def submit_chain(job_file: Path, submission_spec_path: Path) -> str:
