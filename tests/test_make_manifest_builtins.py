@@ -73,6 +73,24 @@ def test_find_inputs_require_and_select(tmp_path: Path) -> None:
         find_inputs([raw], "*.parquet", require=r"A-\d\.parquet")
 
 
+def test_find_inputs_skips_hidden_files_and_folders(tmp_path: Path) -> None:
+    # partial downloads under the final file name, as rsync and transfer scripts leave them
+    raw = _tree(tmp_path, ["A-1.parquet", ".rsync-partial/A-1.parquet", ".A-2.parquet"])
+    (raw / ".transfer" / "partials" / "deep").mkdir(parents=True)
+    (raw / ".transfer" / "partials" / "deep" / "A-3.parquet").write_text("x")
+    files, found = find_inputs([raw], "*.parquet", require=r"A-\d\.parquet")
+    assert found == 1 and [f.relative_to(raw).as_posix() for f in files] == ["sub0/A-1.parquet"]
+    files, found = find_inputs([raw], "*.parquet", include_hidden=True)
+    assert found == 4
+    # patterns with a folder part still match from the right; a hidden search root itself is searched
+    files, _ = find_inputs([raw], "sub0/*.parquet")
+    assert [f.name for f in files] == ["A-1.parquet"]
+    hidden_root = tmp_path / ".hidden-root"
+    (hidden_root / "x").mkdir(parents=True)
+    (hidden_root / "x" / "A-9.parquet").write_text("x")
+    assert [f.name for f in find_inputs([hidden_root], "*.parquet")[0]] == ["A-9.parquet"]
+
+
 def test_build_manifest_packs_files_and_adds_finalize(tmp_path: Path) -> None:
     files = [tmp_path / f"in{i}.parquet" for i in range(5)]
     m = build_manifest(files, outputs=["{out}/_m/{stem}.json"], files_per_branch=2, values={"out": "/b/o"},
