@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import fcntl
+import getpass
 import json
 import os
 from pathlib import Path
 import shutil
-from typing import Any
+from typing import Any, Callable
 import uuid
 
 from . import __version__
@@ -131,6 +131,10 @@ def create_submission_spec(
         "resubmit": resubmit,
         "python_executable": str(python_path),
         "chain_ids": [],
+        # who may change it (output_dir can be a group folder) and which locking protocol its supervisors speak
+        "user": getpass.getuser(),
+        "uid": os.getuid(),
+        "control_lock": CONTROL_LOCK_GENERATION,
     }
     if extra:
         data.update(extra)
@@ -139,31 +143,61 @@ def create_submission_spec(
     return data, path
 
 
+#: Version of the cross-node control lock protocol (hummel_submit.locks) the submission's supervisors use.
+CONTROL_LOCK_GENERATION = 1
+
+
+def submission_owner(spec_path: Path, spec: dict[str, Any]) -> tuple[int, str]:
+    """(uid, name) of the user who made the submission; older submissions: the owner of the submission directory
+    (it is created once and never replaced, unlike submission.json, which every atomic update rewrites)."""
+    uid = spec.get("uid")
+    if uid is None:
+        uid = Path(spec_path).parent.stat().st_uid
+    name = spec.get("user")
+    if not name:
+        try:
+            import pwd
+            name = pwd.getpwuid(int(uid)).pw_name
+        except (KeyError, ImportError):
+            name = str(uid)
+    return int(uid), str(name)
+
+
+def require_owner(spec_path: Path, spec: dict[str, Any], action: str) -> None:
+    """Commands that change a submission (tick, resume, cancel, cleanup, prune, gc) are for its owner only: another
+    user's supervisor would run under that user's account and environment."""
+    uid, name = submission_owner(spec_path, spec)
+    if uid != os.getuid():
+        raise PermissionError(
+            f"submission {spec.get('submission_id', Path(spec_path).parent.name)} belongs to {name}; "
+            f"only {name} can {action} it (read-only commands like submission-status and stats work for everyone)"
+        )
+
+
 def load_submission_spec(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def append_submission_chain(path: Path, chain_id: str) -> dict[str, Any]:
-    lock_path = path.parent / ".submission.lock"
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        data = load_submission_spec(path)
-        if chain_id not in data["chain_ids"]:
-            data["chain_ids"].append(chain_id)
-        atomic_write_json(path, data)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    return data
+    return append_spec_list(path, "chain_ids", chain_id)
 
 
 def append_spec_list(path: Path, key: str, value: Any) -> dict[str, Any]:
     """Append *value* to the list ``spec[key]`` of a submission under the submission lock."""
-    lock_path = path.parent / ".submission.lock"
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        data = load_submission_spec(path)
+    def append(data: dict[str, Any]) -> None:
         items = data.setdefault(key, [])
         if value not in items:
             items.append(value)
+
+    return update_submission_spec(path, append)
+
+
+def update_submission_spec(path: Path, change: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    """Apply *change* to the submission spec in place, under its cross-node mutex (flock is node-local on BeeGFS)."""
+    from .locks import mutex
+
+    with mutex(Path(path).parent / ".submission.mutex"):
+        data = load_submission_spec(path)
+        change(data)
         atomic_write_json(path, data)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     return data

@@ -15,6 +15,7 @@ from __future__ import annotations
 __all__ = ["HummelWorkflow"]
 
 import contextlib
+import os
 import pathlib
 from typing import Any, Generator
 
@@ -28,12 +29,20 @@ from law.util import DotDict, InsertableDict, law_src_path, merge_dicts
 from law.workflow.remote import BaseRemoteWorkflow, BaseRemoteWorkflowProxy, PollData
 
 from ...submission import load_submission_spec
+from ...tick import TICK_ENV
 from .job import HummelJobManager
 
 
 class HummelWorkflowProxy(BaseRemoteWorkflowProxy):
 
     workflow_type: str = "hummel"
+
+    def poll(self) -> None:
+        # law counts retries in memory only (``_job_retries``) but persists ``attempts`` in the jobs file.  A pass
+        # (hummel_submit.tick) is a fresh process, so without this every pass would grant ``retries`` new attempts.
+        for job_num, attempts in self.job_data.attempts.items():
+            self._job_retries[int(job_num)] = max(self._job_retries[int(job_num)], int(attempts))
+        super().poll()
 
     def create_job_manager(self, **kwargs) -> HummelJobManager:
         return self.task.hummel_create_job_manager(**kwargs)
@@ -153,6 +162,9 @@ class HummelWorkflow(BaseRemoteWorkflow):
 
         class MyTask(HummelWorkflow, law.slurm.SlurmWorkflow, law.LocalWorkflow):
             ...  # --workflow hummel | slurm | local
+
+    humsub drives the workflow by *passes* (:mod:`hummel_submit.tick`): law re-run with ``no_poll`` on an existing
+    submission polls once, resubmits failed jobs within ``retries``, submits pending ones and returns.
     """
 
     workflow_proxy_cls = HummelWorkflowProxy
@@ -175,6 +187,13 @@ class HummelWorkflow(BaseRemoteWorkflow):
     exclude_index = True
 
     _humsub_spec_cache: dict[str, Any] | None = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # ``no_poll`` is not passed on by law's req() (exclude_params_req_set), so a workflow required by another task
+        # would poll in a blocking loop; inside a pass every Hummel workflow polls exactly once instead.
+        if os.environ.get(TICK_ENV) == "1":
+            self.no_poll = True
 
     def humsub_submission_spec(self) -> dict[str, Any]:
         if self._humsub_spec_cache is None:

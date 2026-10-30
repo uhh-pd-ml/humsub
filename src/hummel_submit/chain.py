@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-import fcntl
 from pathlib import Path
 import shutil
 
-from .slurm import cancel_jobs, query_jobs, submit
+from .slurm import SlurmError, cancel_jobs, query_jobs, submit
 from .state import create_chain_state, done_marker, load_state, mark_status, state_path
 from .submission import append_submission_chain, load_submission_spec
 
@@ -29,13 +28,22 @@ def lane_dependency(spec: dict[str, object]) -> str | None:
     Chains are assigned round-robin to ``max_concurrent`` lanes; a chain's first hop starts after the
     most recent job of the previous chain in its lane.  Continuation/retry hops of that chain can
     briefly overlap with the next chain, so the cap is "N plus chains currently in a later hop".
+
+    A predecessor that has already ended gives no dependency: ``afterany`` on it would be satisfied at
+    once, and Slurm forgets finished jobs after ``MinJobAge`` (5 min on Hummel-2); Slurm 24.11 treats a
+    dependency on a forgotten id as satisfied, but humsub does not rely on that.  This concerns every
+    chain created later than the initial submission: law retries in a pass, ``humsub resume``,
+    ``--parallel-jobs`` top-ups.
     """
     n = int(spec.get("max_concurrent", 0) or 0)
     chain_ids = list(spec.get("chain_ids", []))
     if n < 1 or len(chain_ids) < n:
         return None
+    path = state_path(Path(str(spec["output_dir"])), chain_ids[-n])
+    if done_marker(path).exists():
+        return None
     try:
-        previous = load_state(state_path(Path(str(spec["output_dir"])), chain_ids[-n]))
+        previous = load_state(path)
     except FileNotFoundError:
         return None
     jobs = previous.get("jobs", [])
@@ -44,14 +52,13 @@ def lane_dependency(spec: dict[str, object]) -> str | None:
 
 @contextlib.contextmanager
 def _submission_lock(submission_spec_path: Path):
-    """Serialise chain creation: law submits from several threads, but lane assignment
-    (``--max-concurrent``) must see every previously created chain."""
-    with (submission_spec_path.parent / ".submit-chain.lock").open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    """Serialise chain creation: law submits from several threads (and a pass may run while a `resume` or `tick` waits),
+    but lane assignment (``--max-concurrent``) must see every previously created chain.  Cross-node mutex; the critical
+    section includes an sbatch, so a holder counts as stale only after 5 minutes."""
+    from .locks import mutex
+
+    with mutex(submission_spec_path.parent / ".submit-chain.mutex", timeout=600, stale=300):
+        yield
 
 
 def submit_chain(job_file: Path, submission_spec_path: Path) -> str:
@@ -82,7 +89,16 @@ def _submit_chain_locked(job_file: Path, submission_spec_path: Path) -> str:
     )
 
     try:
-        inner_job_id = submit(state, chain_state_path, 0)
+        try:
+            inner_job_id = submit(state, chain_state_path, 0)
+        except SlurmError as exc:
+            if not (lane_after and "dependency" in str(exc).lower()):
+                raise
+            # Defensive: a Slurm that rejects a dependency on a forgotten job (the predecessor was killed
+            # without being marked done) - it holds no slot any more, so start without the dependency.
+            state["lane_after"] = None
+            mark_status(chain_state_path, state.get("status", "created"), lane_after=None)
+            inner_job_id = submit(state, chain_state_path, 0)
     except Exception:
         # No scheduler job became live, so remove the unused frozen chain state.
         # law's own submission retry logic can then make a clean attempt without

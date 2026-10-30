@@ -99,7 +99,34 @@ def load_manifest(path: Path) -> dict[str, Any]:
     }
     if hint:
         result["humsub"] = hint
+    if "finalize" in data:
+        result["finalize"] = _load_finalize(data["finalize"], normalized)
     return result
+
+
+def _load_finalize(fin: Any, branches: list[dict[str, Any]]) -> dict[str, Any]:
+    """The optional ``finalize`` step: one extra payload run once every branch is complete (e.g. a merge)."""
+    if not isinstance(fin, dict):
+        raise ManifestError("manifest finalize field must be an object")
+    unknown = set(fin) - {"data", "outputs"}
+    if unknown:
+        raise ManifestError(f"unknown manifest finalize field(s): {', '.join(sorted(unknown))}")
+    payload_data = fin.get("data", {})
+    if not isinstance(payload_data, dict):
+        raise ManifestError("manifest finalize data must be an object")
+    outputs = fin.get("outputs")
+    if not isinstance(outputs, list) or not outputs:
+        raise ManifestError("manifest finalize outputs must be a non-empty array (they mark the step as done)")
+    branch_outputs = {o for b in branches for o in b["outputs"]}
+    normalized: list[str] = []
+    for output in outputs:
+        if not isinstance(output, str) or not output or not Path(output).expanduser().is_absolute():
+            raise ManifestError(f"manifest finalize output must be an absolute path: {output!r}")
+        path = str(Path(output).expanduser())
+        if path in branch_outputs:
+            raise ManifestError(f"manifest finalize output {path} is also a branch output")
+        normalized.append(path)
+    return {"data": payload_data, "outputs": normalized}
 
 
 def freeze_manifest_workflow(
@@ -149,6 +176,23 @@ def freeze_manifest_workflow(
         atomic_write_json(branch_path, context)
         branch_files[str(branch_id)] = str(branch_path)
 
+    finalize_file = None
+    if manifest.get("finalize"):
+        fin = manifest["finalize"]
+        finalize_file = branch_dir / "finalize.json"
+        atomic_write_json(finalize_file, {
+            "schema": 1,
+            "submission_id": spec["submission_id"],
+            "run_name": spec["run_name"],
+            "run_dir": spec["run_dir"],
+            "branch": "finalize",
+            "common": manifest["common"],
+            "data": dict(fin["data"], finalize=True),
+            "outputs": fin["outputs"],
+            "extra_outputs": [],
+            "stages": stages,
+        })
+
     spec["manifest_workflow"] = {
         "schema": 1,
         "manifest": str(frozen_manifest),
@@ -158,6 +202,8 @@ def freeze_manifest_workflow(
         "branch_count": len(manifest["branches"]),
         "stages": stages,
     }
+    if finalize_file is not None:
+        spec["manifest_workflow"]["finalize_file"] = str(finalize_file)
     if workflow_extra:
         spec["manifest_workflow"].update(workflow_extra)
     atomic_write_json(spec_path, spec)

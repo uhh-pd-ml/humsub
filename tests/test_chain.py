@@ -85,3 +85,50 @@ def test_lane_dependency_follows_the_chain_n_back(tmp_path):
     assert lane_dependency({**spec, "max_concurrent": 0}) is None   # no cap
     spec["chain_ids"] = ["c1", "c2"]
     assert lane_dependency({**spec, "max_concurrent": 1}) == "20"  # most recent job of the previous chain
+
+
+def test_lane_dependency_skips_a_predecessor_that_has_ended(tmp_path):
+    """afterany on an ended chain is satisfied anyway, and Slurm rejects ids it has already purged."""
+    import json
+    from hummel_submit.chain import lane_dependency
+    from hummel_submit.state import done_marker, state_path
+
+    out = tmp_path / "out"
+    for chain_id in ("c0", "c1"):
+        path = state_path(out, chain_id)
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"jobs": ["10" if chain_id == "c0" else "11"]}))
+    spec = {"output_dir": str(out), "max_concurrent": 1, "chain_ids": ["c0", "c1"]}
+    assert lane_dependency(spec) == "11"
+    done_marker(state_path(out, "c1")).write_text("completed\n")
+    assert lane_dependency(spec) is None
+
+
+def test_rejected_lane_dependency_falls_back_to_no_dependency(tmp_path):
+    import json
+    from hummel_submit import chain
+    from hummel_submit.slurm import SlurmError
+
+    state_file = tmp_path / "chains" / "new" / "state.json"
+    state_file.parent.mkdir(parents=True)
+    state = {"chain_id": "new", "status": "submitted", "lane_after": "10", "jobs": []}
+    state_file.write_text(json.dumps(state))
+    spec_path = tmp_path / "submission.json"
+    spec_path.write_text(json.dumps({"output_dir": str(tmp_path), "project_dir": str(tmp_path), "config": {},
+                                     "run_name": "r", "resubmit": True, "python_executable": "/py",
+                                     "submission_id": "s", "chain_ids": []}))
+    seen = []
+
+    def fake_submit(st, path, hop):
+        seen.append(st["lane_after"])
+        if st["lane_after"]:
+            raise SlurmError("sbatch failed: sbatch: error: Batch job submission failed: Job dependency problem")
+        return "99"
+
+    with patch.object(chain, "lane_dependency", return_value="10"), \
+         patch.object(chain, "create_chain_state", return_value=(state, state_file)), \
+         patch.object(chain, "submit", side_effect=fake_submit):
+        assert chain.submit_chain(tmp_path / "job.sh", spec_path) == "new"
+    assert seen == ["10", None]
+    assert json.loads(state_file.read_text())["lane_after"] is None
+    assert json.loads(spec_path.read_text())["chain_ids"] == ["new"]

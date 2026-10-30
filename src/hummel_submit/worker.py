@@ -13,12 +13,39 @@ def should_queue_follower(hop: int, max_hops: int) -> bool:
     return hop + 1 < max_hops
 
 
+_ended: list[Path] = []     # the chain this hop ended (completed, failed, stopped)
+
+
 def _mark_done(state_path: Path, reason: str, **fields: object) -> None:
     done_marker(state_path).write_text(reason + "\n", encoding="utf-8")
     mark_status(state_path, reason, **fields)
+    _ended.append(state_path)
+
+
+def _request_pass(state_path: Path) -> None:
+    """The chain has ended: bring the submission's next supervisor pass forward (hummel_submit.trigger).  Best effort,
+    the supervisor's interval still applies if this fails."""
+    try:
+        from .submission import submission_root
+        from .trigger import request_pass
+
+        state = load_state(state_path)
+        spec_path = submission_root(Path(state["output_dir"])) / str(state.get("submission_id")) / "submission.json"
+        if spec_path.is_file():
+            log(f"chain ended; pass requested: {request_pass(spec_path)}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"chain ended; requesting a pass failed (the supervisor interval still applies): {exc}")
 
 
 def main(argv: list[str] | None = None) -> int:
+    _ended.clear()
+    rc = _main(argv)
+    if _ended:
+        _request_pass(_ended[0])
+    return rc
+
+
+def _main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 2:
         print("internal worker usage: python -m hummel_submit.worker STATE_PATH HOP", file=sys.stderr)

@@ -59,12 +59,12 @@ def test_signal_is_requested_when_only_failure_hops_exist() -> None:
     assert any(a.startswith("--signal") for a in base_sbatch_args(state))
 
 
-def test_safety_margin_excludes_other_retry_mechanisms() -> None:
+def test_safety_margin_excludes_payload_retries_but_nests_with_law_retries() -> None:
     SubmitOptions(safety_margin=0.1).validate()
     with pytest.raises(ConfigError, match="mutually exclusive"):
         SubmitOptions(safety_margin=0.1, retry_payload=2).validate()
-    with pytest.raises(ConfigError, match="mutually exclusive"):
-        SubmitOptions(safety_margin=0.1, retries=1, wait=True).validate()
+    SubmitOptions(safety_margin=0.1, retries=1, wait=True).validate()          # law retries a chain whose budget is used up
+    SubmitOptions(safety_margin=0.5, supervisor_job=True).validate()
     with pytest.raises(ConfigError, match="no-resubmit"):
         SubmitOptions(safety_margin=0.1, resubmit=False).validate()
 
@@ -77,7 +77,8 @@ def test_failure_budget_scales_with_chain_length() -> None:
     assert SubmitOptions(safety_margin=0.1, tasks_per_job=25).failure_budget() == 3
 
 
-def test_other_option_validation() -> None:
+def test_other_option_validation(monkeypatch) -> None:
+    monkeypatch.delenv("HUMSUB_MIN_SUPERVISOR_INTERVAL", raising=False)
     with pytest.raises(ConfigError):
         SubmitOptions(retries=1).validate()  # needs --wait
     with pytest.raises(ConfigError):
@@ -116,3 +117,21 @@ def test_manifest_hint_validation(tmp_path: Path) -> None:
     for bad in ({"scratch": "tape"}, {"scratch_bytes_per_branch": -1}, {"nope": 1}):
         with pytest.raises(ManifestError):
             load_manifest(write({"humsub": bad}))
+
+
+def test_parallel_jobs_must_exceed_max_concurrent_when_both_are_given() -> None:
+    SubmitOptions(supervisor_job=True, parallel_jobs=50).validate()
+    SubmitOptions(max_concurrent=50).validate()
+    SubmitOptions(supervisor_job=True, parallel_jobs=200, max_concurrent=50).validate()
+    with pytest.raises(ConfigError, match="lanes would never hold anything back"):
+        SubmitOptions(supervisor_job=True, parallel_jobs=50, max_concurrent=50).validate()
+
+
+def test_supervisor_interval_floor_is_60s_unless_the_tests_lower_it(monkeypatch) -> None:
+    monkeypatch.delenv("HUMSUB_MIN_SUPERVISOR_INTERVAL", raising=False)
+    with pytest.raises(ConfigError, match=">= 60 s"):
+        SubmitOptions(supervisor_job=True, supervisor_interval=10).validate()
+    monkeypatch.setenv("HUMSUB_MIN_SUPERVISOR_INTERVAL", "10")
+    SubmitOptions(supervisor_job=True, supervisor_interval=10).validate()
+    with pytest.raises(ConfigError, match=">= 10 s"):
+        SubmitOptions(supervisor_job=True, supervisor_interval=5).validate()

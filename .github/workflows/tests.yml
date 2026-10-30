@@ -7,6 +7,11 @@ on:
     - cron: "43 5 * * 1"      # weekly: catches changes in the hummel-slurm-ci image (law is pinned)
   workflow_dispatch:
 
+# A new push to the same branch makes the running checks of the previous one pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   unit:
     runs-on: ubuntu-latest
@@ -19,18 +24,35 @@ jobs:
       - run: python -m pytest -q tests --ignore=tests/e2e
 
   e2e:
-    # Real Slurm configured like Hummel-2, from github.com/uhh-pd-ml/hummel-slurm-ci.
-    # The container must run --privileged, which GitHub-hosted runners allow.
+    # Real Slurm configured like Hummel-2, from github.com/uhh-pd-ml/hummel-slurm-ci; the container must run
+    # --privileged, which GitHub-hosted runners allow.  Two profiles (tests/e2e/run.sh):
+    #   fast       every push and PR: fast scheduler loop, the tests send the pre-timeout signal themselves, 5 s
+    #              supervisor passes -- a few minutes.
+    #   realistic  weekly, on main and by hand: Hummel's scheduler timing, real time limits, 60 s supervisor passes.
     runs-on: ubuntu-latest
     needs: unit
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main') && fromJSON('["fast", "realistic"]') || fromJSON('["fast"]') }}
+    name: e2e (${{ matrix.profile }})
     permissions:
       contents: read
-      packages: read      # the image is a private/internal package of this organisation
+      packages: read
     steps:
       - uses: actions/checkout@v4
+      - name: Week (refreshes the wheelhouse weekly, law is installed from its master branch)
+        run: echo "WEEK=$(date +%G-%V)" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/humsub-e2e-wheelhouse
+          key: e2e-wheelhouse-${{ env.WEEK }}-${{ hashFiles('pyproject.toml', 'tests/e2e/run.sh') }}
       - name: Log in to ghcr.io
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Pull the Hummel Slurm image
         run: docker pull ghcr.io/uhh-pd-ml/hummel-slurm-ci:latest
-      - name: End-to-end tests (all, slow ones included; 4 parallel workers, see E2E_WORKERS in run.sh)
-        run: tests/e2e/run.sh -x
+      - name: End-to-end tests (${{ matrix.profile }})
+        env:
+          E2E_PROFILE: ${{ matrix.profile }}
+          IMAGE: ghcr.io/uhh-pd-ml/hummel-slurm-ci:latest
+        run: tests/e2e/run.sh

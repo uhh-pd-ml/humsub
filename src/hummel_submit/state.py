@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import fcntl
 import json
 from pathlib import Path
 import shutil
@@ -118,14 +117,15 @@ def create_chain_state(
 
 
 def _locked_update(path: Path, update: Any) -> dict[str, Any]:
-    lock_path = path.parent / ".state.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    """Read-modify-write of a chain's state under its cross-node mutex: the worker (compute node) and e.g. `humsub
+    cancel` (login node) can update it at the same time, and flock is node-local on BeeGFS."""
+    from .locks import mutex
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with mutex(path.parent / ".state.mutex"):
         data = load_state(path)
         update(data)
         atomic_write_json(path, data)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     return data
 
 
