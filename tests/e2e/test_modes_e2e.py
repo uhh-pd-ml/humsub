@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from .conftest import squeue, SLOW_SIGNAL_SECONDS, SLOW_TIME_LIMIT
+from .conftest import SLOW_SIGNAL_SECONDS, SLOW_TIME_LIMIT
 
 TRAIN = """
     import json, os, sys
@@ -108,7 +108,7 @@ def test_wait_mode_retries_a_failed_branch(project):
     assert out.read_text() == "ok after retry"
     assert sorted(sub.chain_states().values()) == ["failed", "finished"]
     time.sleep(3)
-    assert squeue().strip() == ""
+    assert project.queue().strip() == "", project.queue()
 
 
 def test_wait_mode_without_retries_reports_failure(project):
@@ -178,13 +178,22 @@ def test_gc_and_cleanup(project):
     for d in (orphan, foreign):
         os.utime(d, (old, old))
 
-    dry = project.humsub("gc", check=True).stdout
-    assert "DRY RUN" in dry and (stages / sub.id).exists() and orphan.exists()
+    sel = ("--successful-after-hours", "0", "--orphans-after-hours", "24")
+    dry = project.humsub("gc", *sel, check=True).stdout
+    assert "dry run" in dry and sub.id in dry and "orphans" in dry, dry
+    assert (stages / sub.id).exists() and orphan.exists()
 
-    applied = project.humsub("gc", "--apply", "--successful-after-hours", "0",
-                             "--orphans-after-hours", "24", check=True).stdout
-    assert "APPLY" in applied
-    assert not (stages / sub.id).exists(), "finished submission's staging must be removed"
+    refused = project.humsub("gc", "--apply", *sel)        # no terminal to ask: nothing is deleted unnamed
+    assert refused.returncode == 2 and "not a terminal" in refused.stderr, refused.stdout + refused.stderr
+    assert (stages / sub.id).exists() and orphan.exists()
+
+    named = project.humsub("gc", "--submission", sub.id, *sel, check=True).stdout
+    assert f"cleaned {sub.id}" in named, named
+    assert not (stages / sub.id).exists(), "the named submission's staging must be removed"
+    assert orphan.exists(), "only the named submission is cleaned"
+
+    forced = project.humsub("gc", "--force", *sel, check=True).stdout
+    assert "cleaned orphans" in forced, forced
     assert not orphan.exists(), "old unreferenced staging must be removed"
     assert foreign.exists(), "staging owned by another live submission must be spared"
     # provenance and outputs are preserved
@@ -212,7 +221,7 @@ def test_cleanup_refuses_active_submission_without_force(project):
     project.humsub("cancel", sub.chains[0])
 
 
-@pytest.mark.slow
+@pytest.mark.deadline
 def test_single_command_resumes_from_checkpoint(project):
     project.write_payload("""
         import os, sys, time
@@ -225,11 +234,12 @@ def test_single_command_resumes_from_checkpoint(project):
             time.sleep(600)                      # stopped by the pre-timeout signal
         (run_dir / "final.txt").write_text(Path(resume).read_text())
     """, "train.py")
-    project.configure(
+    project.configure_deadline(
         execution=_single_config(project, auto_args=["--resume={CKPT}"], checkpoint_glob="ckpt-*.txt"),
         time_limit=SLOW_TIME_LIMIT, signal_seconds=SLOW_SIGNAL_SECONDS, max_hops=3,
     )
     sub = project.submit_single("resume")
+    project.reach_deadline(sub.chains[0], 0, after="resume argument: null")
     follow = project.humsub("follow", sub.chains[0], timeout=300)
     assert follow.returncode == 0, follow.stdout + follow.stderr
     assert (project.out / "runs" / "resume" / "final.txt").read_text() == "state after hop 0"
@@ -237,14 +247,17 @@ def test_single_command_resumes_from_checkpoint(project):
     assert "resume argument: null" in logs and "resuming from" in logs
 
 
-@pytest.mark.slow
+@pytest.mark.deadline
 def test_hop_limit_exhausted_marks_chain_failed(project):
     out = project.dir / "results" / "o"
     (project.dir / "results").mkdir()
     manifest = project.write_manifest({0: [out]})
-    payload = project.write_payload("import time\ntime.sleep(600)\n")
-    project.configure(time_limit=SLOW_TIME_LIMIT, signal_seconds=SLOW_SIGNAL_SECONDS, max_hops=2)
+    payload = project.write_payload(
+        "import os, time\nprint('hop', os.environ['HUMSUB_HOP'], 'started', flush=True)\ntime.sleep(600)\n")
+    project.configure_deadline(time_limit=SLOW_TIME_LIMIT, signal_seconds=SLOW_SIGNAL_SECONDS, max_hops=2)
     sub = project.submit(manifest, payload, "limit")
+    project.reach_deadline(sub.chains[0], 0, after="hop 0 started")
+    project.reach_deadline(sub.chains[0], 1, after="hop 1 started")
     states = sub.wait(timeout=400)
     assert list(states.values()) == ["failed"], states
     status = project.humsub("status", sub.chains[0]).stdout

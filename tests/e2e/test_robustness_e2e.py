@@ -1,5 +1,5 @@
 """Robust-production features against a real Slurm: in-job retries, retry hops, lanes, resume, scratch cleanup,
-extra outputs, soft stop, supervisor job."""
+extra outputs, soft stop, supervisor passes."""
 from __future__ import annotations
 
 import json
@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from .conftest import sacct_states, squeue
+from .conftest import DEADLINES, SUPERVISOR_INTERVAL, sacct_states
 
 
 def _job_ids(project, chain: str) -> list[str]:
@@ -126,7 +126,7 @@ def test_max_concurrent_caps_running_chains(project):
     assert peak <= 2, f"{peak} chains ran at the same time: {spans}"
 
 
-def test_resume_runs_only_missing_branches_and_reports_the_lineage(project):
+def test_resume_grants_failed_jobs_new_retries_in_the_same_submission(project):
     res = _results(project)
     outs = {i: [res / f"o{i}.json"] for i in range(3)}
     manifest = project.write_manifest(outs)
@@ -134,32 +134,37 @@ def test_resume_runs_only_missing_branches_and_reports_the_lineage(project):
         import json, os, sys
         from pathlib import Path
         ctx = json.loads(Path(sys.argv[1]).read_text())
-        if ctx["branch"] == 1 and os.environ["HUMSUB_RUN_NAME"] == "first":
-            sys.exit(5)                     # fails only in the first submission
-        Path(ctx["outputs"][0]).write_text(os.environ["HUMSUB_RUN_NAME"])
+        out = Path(ctx["outputs"][0])
+        flag = out.with_suffix(".failed-once")
+        if ctx["branch"] == 1 and not flag.exists():
+            flag.write_text("x")
+            sys.exit(5)                     # fails on its first attempt only
+        out.write_text(os.environ["SLURM_JOB_ID"])
     """)
     first = project.submit(manifest, payload, "first")
     states = first.wait()
     assert sorted(states.values()) == ["failed", "finished", "finished"], states
     status = project.humsub("submission-status", first.id, check=True).stdout
-    assert "2 done" in status and "1 missing" in status and "humsub resume" in status
+    assert "2 done" in status and "1 failed" in status and "humsub resume" in status
+    done_before = outs[0][0].read_text()
 
     dry = project.humsub("resume", first.id, "--dry-run", check=True)
-    assert "resubmitting 1 of 3 branches" in dry.stdout
+    assert "1 failed law job(s) get a fresh budget of 1 retry" in dry.stdout, dry.stdout
     assert not outs[1][0].exists(), "--dry-run submits nothing"
 
     again = project.humsub("resume", first.id, check=True)
-    m = re.search(r"\[submit\] submission\s+(\S+)", again.stdout)
-    assert m and "first-resume1" in again.stdout, again.stdout
-    from .conftest import Submission
-    resumed = Submission(project, again)
-    assert set(resumed.wait().values()) == {"finished"}
-    assert outs[1][0].read_text() == "first-resume1"
-    assert outs[0][0].read_text() == "first", "branches that were done are not redone"
+    assert "[resume] pass: progress" in again.stdout, again.stdout
+    assert "[submit] submission" not in again.stdout, "resume stays in the same submission"
+    deadline = time.time() + 150
+    while not outs[1][0].exists() and time.time() < deadline:
+        time.sleep(3)
+    assert outs[1][0].exists(), f"law did not resubmit the failed job\n{project.queue()}\n{_logs(project)[-2000:]}"
+    assert outs[0][0].read_text() == done_before, "branches that were done are not redone"
+    time.sleep(5)
     summary = project.humsub("submission-status", first.id, check=True).stdout
-    assert "3 done" in summary and "0 missing" in summary
+    assert "3 done" in summary and "0 failed" in summary
     nothing = project.humsub("resume", first.id, check=True)
-    assert "nothing to resume" in nothing.stdout
+    assert "0 failed law job(s)" in nothing.stdout and "[resume] pass: complete" in nothing.stdout
 
 
 def test_failed_branch_leaves_no_big_scratch_but_keeps_small_diagnostics(project):
@@ -220,23 +225,31 @@ def test_extra_output_paths_are_validated(project):
     assert r.proc.returncode != 0 and "extra output must be absolute" in r.text
 
 
-@pytest.mark.slow
+@pytest.mark.deadline
 def test_soft_stop_lets_a_nearly_done_payload_finish_and_holds_back_the_next_branch(project):
     res = _results(project)
     outs = {0: [res / "a.json"], 1: [res / "b.json"]}
-    manifest = project.write_manifest(outs, {0: {"work": 100}, 1: {"work": 5}})
+    manifest = project.write_manifest(outs, {0: {"until_notice": True}, 1: {"work": 5}})
     payload = project.write_payload("""
         import json, os, sys, time
         from pathlib import Path
         ctx = json.loads(Path(sys.argv[1]).read_text())
-        time.sleep(ctx["data"]["work"])
+        print(f"branch {ctx['branch']} working in hop {os.environ['HUMSUB_HOP']}", flush=True)
+        if ctx["data"].get("until_notice"):         # straddles the notice, then is nearly done
+            end = time.time() + 280
+            while not os.path.exists(os.environ["HUMSUB_SOFT_STOP_FILE"]) and time.time() < end:
+                time.sleep(1)
+            time.sleep(2)
+        else:
+            time.sleep(ctx["data"]["work"])
         flag = os.path.exists(os.environ["HUMSUB_SOFT_STOP_FILE"])
         Path(ctx["outputs"][0]).write_text(json.dumps({"hop": os.environ["HUMSUB_HOP"], "soft": flag}))
     """)
-    # notice 90-120 s... after 0-30 s early delivery: the 100 s branch always straddles the notice; the hard stop is 60 s later
-    project.configure(time_limit="00:04:00", signal_seconds=150, grace_seconds=60, max_hops=3)
+    # real limits: the notice comes 90-120 s into hop 0 (0-30 s early delivery); the hard stop is 60 s after it
+    project.configure_deadline(time_limit="00:04:00", signal_seconds=150, grace_seconds=60, max_hops=3)
     sub = project.submit(manifest, payload, "soft", "--tasks-per-job", "2")
     assert sub.proc.returncode == 0, sub.text
+    project.reach_deadline(sub.chains[0], 0, after="branch 0 working in hop 0")
     states = sub.wait(timeout=400)
     assert list(states.values()) == ["finished"], states
     a, b = (json.loads(outs[i][0].read_text()) for i in (0, 1))
@@ -248,54 +261,96 @@ def test_soft_stop_lets_a_nearly_done_payload_finish_and_holds_back_the_next_bra
     assert len(_ran_jobs(project, sub.chains[0])) == 2, "hop 0 (branch a) and hop 1 (branch b)"
 
 
-@pytest.mark.slow
+@pytest.mark.deadline
 def test_payload_that_stops_on_the_notice_is_a_hop_boundary_not_a_failure(project):
     res = _results(project)
     out, progress = res / "o.json", res / "o.progress"
+    # with real limits the work must outlast hop 0's usable time (notice after 90-120 s); with a sent signal a few
+    # seconds of work around the notice are enough
+    total, step = (150, 5) if DEADLINES == "slurm" else (8, 1)
     manifest_path = project.dir / "manifest.json"
-    manifest_path.write_text(json.dumps({"schema": 1, "branches": [
+    manifest_path.write_text(json.dumps({"schema": 1, "common": {"total": total, "step": step}, "branches": [
         {"id": 0, "outputs": [str(out)], "extra_outputs": [str(progress)]}]}))
     payload = project.write_payload(f"""
         import json, os, sys, time
         from pathlib import Path
         ctx = json.loads(Path(sys.argv[1]).read_text())
+        total, step = ctx["common"]["total"], ctx["common"]["step"]
         prog = Path(ctx["extra_outputs"][0])
         done = int(prog.read_text()) if prog.exists() else 0
-        while done < 150:
-            time.sleep(5)
-            done += 5
+        while done < total:
+            time.sleep(step)
+            done += step
             prog.write_text(str(done))
+            print(f"progress {{done}} in hop {{os.environ['HUMSUB_HOP']}}", flush=True)
             if os.path.exists(os.environ["HUMSUB_SOFT_STOP_FILE"]):
                 sys.exit(3)                                # out of time: checkpointed, stop
         Path(ctx["outputs"][0]).write_text("done after hop " + os.environ["HUMSUB_HOP"])
     """)
-    project.configure(time_limit="00:04:00", signal_seconds=150, grace_seconds=60, max_hops=5)
+    project.configure_deadline(time_limit="00:04:00", signal_seconds=150, grace_seconds=60, max_hops=5)
     sub = project.submit(manifest_path, payload, "boundary", "--retry-payload", "2")
+    project.reach_deadline(sub.chains[0], 0, after="progress 3 in hop 0")
     assert list(sub.wait(timeout=500).values()) == ["finished"]
     assert out.read_text().startswith("done after hop"), out.read_text()
+    assert out.read_text() != "done after hop 0", "the notice must have ended hop 0"
     logs = _logs(project)
     assert "payload stopped after the soft-stop notice" in logs
     assert "attempt 1 failed" not in logs, "a payload that yields at the deadline must not be retried or counted as failing"
 
 
-@pytest.mark.slow
-def test_supervisor_job_resumes_missing_branches_without_a_controller(project):
+@pytest.mark.supervisor
+def test_supervisor_passes_retry_a_failed_job_without_a_controller(project):
     out = _results(project) / "o.json"
     manifest = project.write_manifest({0: [out]})
     payload = project.write_payload(f"""
         import os, sys
         from pathlib import Path
-        if os.environ["HUMSUB_RUN_NAME"] == "sup":
-            sys.exit(4)                       # the first submission fails, the supervisor's resume succeeds
-        Path({str(out)!r}).write_text(os.environ["HUMSUB_RUN_NAME"])
+        flag = Path({str(out)!r} + ".failed-once")
+        if not flag.exists():
+            flag.write_text("x")
+            sys.exit(4)                       # the first attempt fails, law's retry (a supervisor pass) succeeds
+        Path({str(out)!r}).write_text(os.environ["SLURM_JOB_ID"])
     """)
-    sub = project.submit(manifest, payload, "sup", "--supervisor-job", "--supervisor-interval", "60", "--supervisor-rounds", "2")
+    sub = project.submit(manifest, payload, "sup", "--supervisor-job", "--supervisor-interval", SUPERVISOR_INTERVAL, "--retries", "2")
     assert sub.proc.returncode == 0 and "[submit] supervisor  job" in sub.text, sub.text
     deadline = time.time() + 420
     while not out.exists() and time.time() < deadline:
         time.sleep(5)
-    assert out.exists(), f"supervisor did not resume the branch\n{squeue()}\n{_logs(project)[-2000:]}"
-    assert out.read_text() == "sup-resume1"
-    time.sleep(90)  # the supervisor verifies once more and ends
+    assert out.exists(), f"the supervisor's pass did not retry the job\n{project.queue()}\n{_logs(project)[-2000:]}"
+    project.wait_for_log("pass complete -> done", 120)  # the next pass finds the top task complete
     summary = project.humsub("submission-status", sub.id, check=True).stdout
-    assert "1 done" in summary and "0 missing" in summary
+    assert "1 done" in summary and "0 failed" in summary
+    assert "pass complete -> done" in _logs(project)
+
+
+@pytest.mark.supervisor
+def test_lanes_and_law_retries_work_together(project):
+    """--max-concurrent with law retries: a retry chain is created long after the initial submission; it must not wait on
+    a lane predecessor that has ended, and the cap must still hold."""
+    res = _results(project)
+    outs = {i: [res / f"o{i}.json"] for i in range(3)}
+    manifest = project.write_manifest(outs)
+    payload = project.write_payload("""
+        import json, sys, time
+        from pathlib import Path
+        ctx = json.loads(Path(sys.argv[1]).read_text())
+        out = Path(ctx["outputs"][0])
+        flag = out.with_suffix(".failed-once")
+        if ctx["branch"] == 0 and not flag.exists():
+            flag.write_text("x")
+            sys.exit(4)
+        start = time.time()
+        time.sleep(4)
+        out.write_text(json.dumps([start, time.time()]))
+    """)
+    sub = project.submit(manifest, payload, "lanes-retry", "--max-concurrent", "1", "--supervisor-job",
+                         "--supervisor-interval", SUPERVISOR_INTERVAL, "--retries", "1")
+    assert sub.proc.returncode == 0, sub.text
+    deadline = time.time() + 420
+    while not all(o[0].exists() for o in outs.values()) and time.time() < deadline:
+        time.sleep(5)
+    assert all(o[0].exists() for o in outs.values()), f"{project.queue()}\n{_logs(project)[-3000:]}"
+    spans = sorted(json.loads(o[0].read_text()) for o in outs.values())
+    assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:])), f"lanes overlapped: {spans}"
+    status = project.humsub("submission-status", sub.id, check=True).stdout
+    assert "3 done" in status and "0 failed" in status, status

@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from .conftest import sacct_states, squeue, SLOW_SIGNAL_SECONDS, SLOW_TIME_LIMIT
+from .conftest import sacct_states, SLOW_SIGNAL_SECONDS, SLOW_TIME_LIMIT
 
 SUM_PAYLOAD = """
     import json, os, sys
@@ -47,7 +47,7 @@ def test_roundtrip_resubmit_and_cleanup(project):
 
     # a completed chain must not leave its pre-queued follower behind
     time.sleep(3)
-    assert squeue().strip() == "", squeue()
+    assert project.queue().strip() == "", project.queue()
 
     # resubmitting a complete manifest is a successful no-op
     again = project.submit(manifest, payload, "second")
@@ -91,7 +91,7 @@ def test_failing_payload_fails_chain_and_leaves_no_partial_output(project):
     assert "failed" in status
     # the pre-queued follower of a failed chain is not left pending
     time.sleep(3)
-    assert squeue().strip() == "", squeue()
+    assert project.queue().strip() == "", project.queue()
 
 
 def test_exit_zero_without_output_is_a_failure(project):
@@ -119,7 +119,7 @@ def test_cancel_stops_chain_and_its_jobs(project):
     r = project.humsub("cancel", chain)
     assert r.returncode == 0, r.stdout + r.stderr
     time.sleep(4)
-    assert squeue().strip() == "", squeue()
+    assert project.queue().strip() == "", project.queue()
     assert list(sub.chain_states().values()) == ["failed"]
     assert not out.exists()
 
@@ -130,7 +130,7 @@ def test_dry_run_submits_nothing(project):
                        "--run-name", "dry")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "branches    2" in r.stdout
-    assert squeue().strip() == ""
+    assert project.queue().strip() == "", project.queue()
     assert not (project.out / ".hummel-submit" / "chains").exists()
 
 
@@ -140,14 +140,14 @@ def test_site_rules_are_enforced_by_the_cluster(project):
     r = project.submit(manifest, payload, "mem", "--sbatch-arg=--mem=1G")
     assert r.proc.returncode != 0
     assert "mem" in r.text.lower()
-    assert squeue().strip() == ""
+    assert project.queue().strip() == "", project.queue()
     # a partition the account has no association for is rejected by accounting
     r = project.submit(manifest, payload, "wrongpart", "--partition", "gpu")
     assert r.proc.returncode != 0
     assert "Invalid account or account/partition" in r.text or "invalid" in r.text.lower(), r.text[-800:]
 
 
-@pytest.mark.slow
+@pytest.mark.deadline
 def test_continuation_across_hops(project):
     """Hop 0 is stopped by the pre-timeout signal; hop 1 re-runs the branch and completes."""
     out = project.dir / "results" / "o.json"
@@ -162,8 +162,9 @@ def test_continuation_across_hops(project):
             time.sleep(600)                      # never finishes; the chain stops it before the limit
         Path({str(out)!r}).write_text("done in hop %d" % hop)
     """)
-    project.configure(time_limit=SLOW_TIME_LIMIT, signal_seconds=SLOW_SIGNAL_SECONDS, max_hops=3)
+    project.configure_deadline(time_limit=SLOW_TIME_LIMIT, signal_seconds=SLOW_SIGNAL_SECONDS, max_hops=3)
     sub = project.submit(manifest, payload, "hops")
+    project.reach_deadline(sub.chains[0], 0, after="payload running in hop 0")
     states = sub.wait(timeout=300)
     assert list(states.values()) == ["finished"], states
     assert out.read_text() == "done in hop 1"

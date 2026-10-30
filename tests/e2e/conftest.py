@@ -29,18 +29,34 @@ SLOW_SIGNAL_SECONDS = 60
 
 E2E_ENABLED = os.environ.get("HUMSUB_E2E") == "1" and shutil.which("sbatch") is not None
 
+# How tests that need a hop to run out of time get there (tests/e2e/run.sh sets it from E2E_PROFILE):
+#   "signal" (fast profile)      the test sends the pre-timeout signal itself, exactly what slurmctld sends at the
+#                                deadline (scancel --batch --signal=USR1 to the hop's batch shell, which is the worker);
+#                                the time limits are long, so nothing else interferes.  Seconds instead of minutes.
+#   "slurm"  (realistic profile) real time limits: slurmctld's own clock delivers --signal=B:USR1@N.  Minutes.
+DEADLINES = os.environ.get("HUMSUB_E2E_DEADLINES", "signal")
+#: --supervisor-interval of the tests (run.sh lowers humsub's 60 s floor to match in the fast profile)
+SUPERVISOR_INTERVAL = os.environ.get("HUMSUB_E2E_SUPERVISOR_INTERVAL", "10")
+
 
 def pytest_collection_modifyitems(config, items):
-    if E2E_ENABLED:
+    if not E2E_ENABLED:
+        skip = pytest.mark.skip(reason="needs HUMSUB_E2E=1 and a Slurm (see tests/e2e/run.sh)")
+        for item in items:
+            if "e2e" in str(item.fspath):
+                item.add_marker(skip)
         return
-    skip = pytest.mark.skip(reason="needs HUMSUB_E2E=1 and a Slurm (see tests/e2e/run.sh)")
     for item in items:
-        if "e2e" in str(item.fspath):
-            item.add_marker(skip)
+        if DEADLINES == "slurm" and item.get_closest_marker("deadline"):
+            item.add_marker(pytest.mark.slow)
+        if int(SUPERVISOR_INTERVAL) >= 60 and item.get_closest_marker("supervisor"):
+            item.add_marker(pytest.mark.slow)
 
 
 def pytest_configure(config):
-    config.addinivalue_line("markers", "slow: takes minutes (real Slurm time limits)")
+    config.addinivalue_line("markers", "slow: takes minutes in the current profile")
+    config.addinivalue_line("markers", "deadline: a hop runs out of time (see DEADLINES): slow with real time limits")
+    config.addinivalue_line("markers", "supervisor: waits for supervisor passes: slow with Hummel's 60 s interval")
 
 
 class Project:
@@ -49,10 +65,11 @@ class Project:
     def __init__(self, root: Path, cache: Path) -> None:
         self.dir = root / "project"
         self.out = root / "out"
+        self.bulk = root / "bulk-scratch"       # per test: tests run in parallel and gc sweeps scratch roots
         self.cache = cache
         self.dir.mkdir(parents=True)
         # law polls its jobs every minute by default; luigi reads ./luigi.cfg
-        (self.dir / "luigi.cfg").write_text("[ManifestPayloadWorkflow]\npoll_interval = 3s\n\n[PayloadWorkflow]\npoll_interval = 3s\n")
+        (self.dir / "luigi.cfg").write_text("[ManifestPayloadWorkflow]\npoll_interval = 3s\n\n[ManifestFinalizeWorkflow]\npoll_interval = 3s\n\n[PayloadWorkflow]\npoll_interval = 3s\n")
         self.configure()
 
     def configure(self, execution: dict | None = None, **slurm) -> None:
@@ -66,7 +83,8 @@ class Project:
             "signal_seconds": 30,
         }
         values.update(slurm)
-        ex = {"image": "none", "output_dir": str(self.out), "cache_dir": str(self.cache)}
+        ex = {"image": "none", "output_dir": str(self.out), "cache_dir": str(self.cache),
+              "bulk_scratch_dir": str(self.bulk)}
         ex.update(execution or {})
         lines = ["[execution]"] + [f"{k} = {json.dumps(v)}" for k, v in ex.items()] + ["", "[slurm]"]
         lines += [f"{k} = {json.dumps(v)}" for k, v in values.items()]
@@ -100,6 +118,67 @@ class Project:
         if check and proc.returncode != 0:
             raise AssertionError(f"humsub {' '.join(args)} failed ({proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
         return proc
+
+    def job_ids(self) -> set[str]:
+        """Every Slurm job this test's submissions created: chain hops (incl. followers) and supervisor jobs."""
+        ids: set[str] = set()
+        hs = self.out / ".hummel-submit"
+        for path in list(hs.glob("chains/*/state.json")) + list(hs.glob("submissions/*/submission.json")):
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            ids |= {str(j) for j in data.get("jobs", []) + data.get("supervisor_job_ids", [])}
+        return ids
+
+    def queue(self) -> str:
+        """squeue lines of this test's jobs only (tests run in parallel on one cluster)."""
+        mine = self.job_ids()
+        return "\n".join(line for line in squeue().splitlines() if line.split() and line.split()[0] in mine)
+
+    def logs(self) -> str:
+        return "".join(p.read_text(errors="replace") for p in sorted((self.out / "logs").glob("*.log")))
+
+    def configure_deadline(self, *, time_limit: str, signal_seconds: int, **slurm) -> None:
+        """Slurm settings of a test whose hops run out of time: *time_limit* is the real limit (DEADLINES="slurm");
+        with DEADLINES="signal" the limit is long and the test calls reach_deadline() instead.  signal_seconds (and
+        with it the grace period) are the same in both modes, so humsub behaves the same."""
+        self.configure(time_limit=time_limit if DEADLINES == "slurm" else "00:15:00", signal_seconds=signal_seconds,
+                       **slurm)
+
+    def reach_deadline(self, chain: str, hop: int, *, after: str, timeout: int = 240) -> None:
+        """Let hop *hop* of *chain* reach its pre-timeout signal.  With DEADLINES="slurm" Slurm sends it at the time
+        limit, so this returns at once.  With "signal" it waits until the hop runs and *after* (a line the payload
+        prints) appears in the logs, then sends what slurmctld would: SIGUSR1 to the hop's batch shell.  *after* must
+        come from the payload: the worker installs its handler only right before starting it, and an earlier SIGUSR1
+        would kill the worker (its default action)."""
+        if DEADLINES != "signal":
+            return
+        state_file = self.out / ".hummel-submit" / "chains" / chain / "state.json"
+        deadline = time.time() + timeout
+        while True:
+            try:
+                state = json.loads(state_file.read_text())
+            except (OSError, ValueError):
+                state = {}
+            job = state.get("current_job_id")
+            if state.get("current_hop") == hop and job and after in self.logs():
+                break
+            if time.time() > deadline:
+                raise AssertionError(f"hop {hop} of {chain} did not get to {after!r} in {timeout}s: {state}\n"
+                                     f"{self.queue()}\n{self.logs()[-3000:]}")
+            time.sleep(1)
+        subprocess.run(["scancel", "--batch", "--signal=USR1", str(job)], check=True, capture_output=True)
+
+    def wait_for_log(self, needle: str, timeout: int) -> str:
+        deadline = time.time() + timeout
+        while True:
+            logs = self.logs()
+            if needle in logs:
+                return logs
+            if time.time() > deadline:
+                raise AssertionError(f"{needle!r} not in the logs after {timeout}s\n{self.queue()}\n{logs[-3000:]}")
+            time.sleep(2)
 
     def submit_single(self, run: str, *args: str, **kw) -> "Submission":
         proc = self.humsub("submit", "--run-name", run, "--", *args, **kw)
@@ -143,7 +222,7 @@ class Submission:
             if states and not {"pending", "running"} & set(states.values()):
                 return states
             if time.time() > deadline:
-                raise AssertionError(f"chains still active after {timeout}s: {states}\n{squeue()}")
+                raise AssertionError(f"chains still active after {timeout}s: {states}\n{self.project.queue()}")
             time.sleep(2)
 
 
@@ -173,7 +252,7 @@ def _tail(path: Path, lines: int = 40) -> str:
 
 def diagnostics(proj: "Project") -> str:
     """Everything needed to understand a failed e2e test from the CI log alone."""
-    parts = ["queue:\n" + squeue(),
+    parts = ["queue (this test's jobs):\n" + proj.queue(),
              "sacct:\n" + subprocess.run(["sacct", "-X", "-n", "-o", "JobID,JobName,State,ExitCode,Elapsed,Timelimit,Start,End"],
                                           text=True, capture_output=True).stdout]
     for state in sorted((proj.out / ".hummel-submit" / "chains").glob("*/state.json")):
@@ -201,7 +280,10 @@ def project(request):
     rep = getattr(request.node, "rep_call", None)
     if rep is not None and rep.failed:
         sys.stderr.write(f"\n===== e2e diagnostics for {request.node.name} =====\n{diagnostics(proj)}\n=====\n")
-    subprocess.run(["scancel", "-u", os.environ.get("USER", "testuser")], check=False)
+    # only this test's jobs: the others run in parallel on the same cluster
+    mine = sorted(proj.job_ids())
+    if mine:
+        subprocess.run(["scancel", *mine], check=False, capture_output=True)
     if not request.config.getoption("--keep-e2e", default=False):
         shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(cache, ignore_errors=True)
