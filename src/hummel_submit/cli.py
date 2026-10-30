@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 from pathlib import Path
 import shlex
 import shutil
@@ -40,6 +41,9 @@ from .manifest_submit import (
     submit_manifest_run,
 )
 from .doctor import local_checks, manifest_paths, run_probe
+from .make_manifest import build_manifest, find_inputs, json_object, parse_assignments
+from .payloads import resolve as resolve_builtin_payload
+from .state import atomic_write_json
 from .prune import apply_plan, fmt as fmt_size, plan_submission, select_submissions as select_prune_submissions
 from .stats import format_stats, stats_for, to_json as stats_json
 from .lineage import (
@@ -159,7 +163,11 @@ def _parser() -> argparse.ArgumentParser:
         help="submit a generic manifest of independent branches to an executable payload",
     )
     manifest.add_argument("--manifest", type=Path, required=True, help="JSON manifest (schema 1)")
-    manifest.add_argument("--payload", type=Path, required=True, help="executable invoked once per branch")
+    manifest.add_argument(
+        "--payload", required=True, metavar="PATH|builtin:NAME",
+        help="executable invoked once per branch, or a built-in payload (builtin:container runs the manifest's "
+             "command in an Apptainer image)",
+    )
     manifest.add_argument(
         "--stage", action="append", default=[], metavar="NAME=PATH",
         help="freeze a file or directory for all branches; repeat as needed",
@@ -182,6 +190,29 @@ def _parser() -> argparse.ArgumentParser:
     manifest.add_argument("--dry-run", action="store_true", help="validate the manifest, stages and paths; submit nothing")
     _add_slurm_options(manifest)
     _add_manifest_policy_options(manifest)
+
+    make = sub.add_parser(
+        "make-manifest",
+        help="write a manifest from a folder search: one entry per input file, outputs from templates, "
+             "inputs packed into branches",
+    )
+    make.add_argument("--search", type=Path, action="append", required=True, metavar="DIR",
+                      help="folder searched recursively (repeatable)")
+    make.add_argument("--glob", default="*", help="file name pattern of the inputs (default: *)")
+    make.add_argument("--require", metavar="REGEX", help="every file name found must fullmatch this, else stop")
+    make.add_argument("--select", metavar="REGEX", help="only file names that fullmatch this become inputs")
+    make.add_argument("--output", action="append", required=True, metavar="TEMPLATE",
+                      help="declared output per input file (repeatable); fields {stem} {name} {parent} and --set keys")
+    make.add_argument("--files-per-branch", type=int, default=1, metavar="K",
+                      help="input files per branch (one payload run handles all of them); default 1")
+    make.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                      help="string value in common and a template field (repeatable)")
+    make.add_argument("--common", type=Path, metavar="JSON_FILE", help="JSON object merged into common")
+    make.add_argument("--common-json", metavar="JSON", help="JSON object merged into common")
+    make.add_argument("--finalize-output", action="append", default=[], metavar="TEMPLATE",
+                      help="output of the finalize step, run once all branches are done (repeatable)")
+    make.add_argument("--finalize-data-json", metavar="JSON", help="data of the finalize step (e.g. its own command)")
+    make.add_argument("-o", "--manifest", type=Path, required=True, help="manifest file to write")
 
     sub.add_parser("help", help="show this help message")
 
@@ -503,7 +534,7 @@ def cmd_submit_manifest(args: argparse.Namespace) -> int:
     config, sources = load_config(project_dir, _cli_overrides(args), require_command=False)
     run_name = default_run_name() if args.run_name is None else validate_run_name(args.run_name)
     manifest_source = args.manifest.expanduser().absolute()
-    payload_source = args.payload.expanduser().absolute()
+    payload_source = resolve_builtin_payload(args.payload) or Path(args.payload).expanduser().absolute()
     if not manifest_source.is_file():
         raise ConfigError(f"manifest does not exist: {manifest_source}")
     if not payload_source.is_file():
@@ -523,6 +554,34 @@ def cmd_submit_manifest(args: argparse.Namespace) -> int:
         opts=opts,
         skip_path_checks=args.skip_path_checks,
         dry_run=args.dry_run,
+    )
+    return 0
+
+
+def cmd_make_manifest(args: argparse.Namespace) -> int:
+    values = parse_assignments(args.set)
+    common: dict[str, Any] = {}
+    if args.common:
+        common.update(json_object(args.common.read_text(encoding="utf-8"), str(args.common)))
+    if args.common_json:
+        common.update(json_object(args.common_json, "--common-json"))
+    files, found = find_inputs(args.search, args.glob, require=args.require, select=args.select)
+    manifest = build_manifest(
+        files,
+        outputs=args.output,
+        files_per_branch=args.files_per_branch,
+        common=common,
+        values=values,
+        finalize_outputs=args.finalize_output,
+        finalize_data=json_object(args.finalize_data_json, "--finalize-data-json") if args.finalize_data_json else None,
+    )
+    args.manifest.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(args.manifest, manifest)
+    load_manifest(args.manifest)  # the same validation submit-manifest applies
+    print(
+        f"[make-manifest] {args.manifest}: {len(manifest['branches'])} branch(es), {len(files)} input file(s) "
+        f"({found - len(files)} of {found} found left out by --select)"
+        + (", with a finalize step" if "finalize" in manifest else "")
     )
     return 0
 
@@ -834,9 +893,22 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = {"help", "init", "config", "submit", "submit-manifest", "resume", "status", "follow", "submission-status", "cleanup", "gc", "cancel", "stats", "prune", "doctor"}
+    commands = sorted(
+        name for action in parser._subparsers._group_actions for name in action.choices  # type: ignore[union-attr]
+    )
     top_level = {"-h", "--help", "--version"}
     if argv and argv[0] not in commands and argv[0] not in top_level:
+        if not argv[0].startswith("-"):
+            # An unknown or mistyped command (or one this installed version does not have yet) must never turn into a
+            # job submission: only `humsub -- ARGS` and `humsub --option ...` are shorthands for `humsub submit`.
+            close = difflib.get_close_matches(argv[0], commands, n=1)
+            hint = f"; did you mean {close[0]!r}?" if close else ""
+            print(
+                f"humsub: error: unknown command {argv[0]!r}{hint} (humsub {__version__}; "
+                "arguments for the configured command go after `humsub submit --`)",
+                file=sys.stderr,
+            )
+            return 2
         argv.insert(0, "submit")
     args = parser.parse_args(argv)
     try:
@@ -850,6 +922,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_submit(args)
         if args.subcommand == "submit-manifest":
             return cmd_submit_manifest(args)
+        if args.subcommand == "make-manifest":
+            return cmd_make_manifest(args)
         if args.subcommand == "resume":
             return cmd_resume(args)
         if args.subcommand == "status":

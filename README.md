@@ -106,6 +106,35 @@ humsub cleanup SUBMISSION_ID             # delete the staged inputs on the SSD o
   them in the branch context (`"extra_outputs": [...]`).  Their paths are fixed in the manifest, so they are identical in every
   submission of a lineage: a checkpoint written in one hop is found by the next hop, by a retry, by `humsub resume`, and by a later
   study that points at the same path (e.g. to continue training on more data).  Retention is the manifest author's decision.
+* `finalize` (optional) is a fan-in step that runs **once, after every branch is complete**, e.g. merging per-branch summaries:
+
+  ```json
+  "finalize": {"data": {"command": ["python", "merge.py"]}, "outputs": ["/beegfs/.../summary.json"]}
+  ```
+
+  The schema is accepted (and `make-manifest` writes it), but **this version cannot run it yet**: `submit-manifest` refuses
+  a manifest with a `finalize` section.
+
+### Manifests from a folder search: `make-manifest`
+
+For "input files → known output files" work, nothing needs to be listed per file:
+
+```bash
+humsub make-manifest --search /beegfs/.../raw --glob '*.parquet' \
+    --require '.+-NEVENT[0-9]+-RS[0-9]+\.parquet' --select '(QCD|tt).+\.parquet' \
+    --output '{out}/_manifests/{stem}.json' --set out=/beegfs/.../converted \
+    --files-per-branch 50 --finalize-output '{out}/manifest.json' -o manifest.json
+```
+
+* every file below `--search` matching `--glob` must fullmatch `--require` (else it stops: an unexpected file is a problem to
+  look at, not something to skip); of those, the ones matching `--select` become inputs;
+* each input declares the `--output` templates (`{stem}`, `{name}`, `{parent}` of the input and every `--set` key); two inputs
+  that would write the same output are an error;
+* `--files-per-branch K` packs K inputs into one branch (`data.inputs`): one payload run handles all of them.  Prefer this over
+  `--tasks-per-job` when every payload start is expensive (container start, imports): `--tasks-per-job` still starts the
+  payload once per branch;
+* `--set KEY=VALUE`, `--common FILE`, `--common-json JSON` fill `common`; `--finalize-output`/`--finalize-data-json` add a
+  `finalize` step.
 
 ## The payload
 
@@ -170,6 +199,27 @@ An optional top-level `"humsub"` object in the manifest carries hints for the su
 
 `scratch` (`beegfs`|`ssd`) selects the bulk scratch unless `--scratch` is given; `scratch_bytes_per_branch` feeds the
 preflight quota check when the bulk scratch is on the SSD.
+
+### Built-in payload: `builtin:container`
+
+`--payload builtin:container` runs a command from the manifest inside an Apptainer image, so a containerised application
+needs no payload script at all:
+
+```json
+"common": {
+  "container": {"image": "/beegfs/.../app.sif", "workdir": "{stage_code}", "env": {"PYTHONPATH": "{stage_code}"}},
+  "command": ["python", "scripts/convert.py", "{inputs}", "--out", "{out}"],
+  "out": "/beegfs/.../converted"
+}
+```
+
+* `container`: `image` (required), `binds` (default `["/beegfs"]`; the stages and the branch scratch are always bound),
+  `env`, `workdir`, `apptainer` (default: on `PATH`, else the newest under `/sw/env/system-gcc/apptainer`), `nv` (GPUs).
+* `command` comes from `data.command` if the branch has one (so `finalize` can run another command), else `common.command`.
+  An element that is exactly `"{inputs}"`/`"{outputs}"` expands to the branch's `data.inputs`/declared outputs; `{field}`
+  is replaced from the string values of `common` and `data`, `stage_<name>`, `run_dir`, `branch`, `scratch`, `scratch_fast`.
+* humsub's own `PYTHONPATH` is not forwarded into the container.  Stage the application's code (`--stage code=...`) and
+  point `workdir`/`PYTHONPATH` at `{stage_code}` to run exactly the submitted version of it.
 
 ### Stages
 
@@ -252,7 +302,9 @@ logs; `$SSD` for small-file/random I/O and caches (no backup; 100 GiB quota); `/
 ```text
 humsub init [--project-only | --user-only]     write config templates
 humsub config [--json]                         show resolved configuration
-humsub submit-manifest --manifest M --payload P [--stage N=PATH]… [--stage-exclude N=PATTERN]…
+humsub make-manifest --search DIR… [--glob G] [--require RE] [--select RE] --output TEMPLATE… [--files-per-branch K]
+        [--set KEY=VALUE]… [--common FILE] [--common-json JSON] [--finalize-output TEMPLATE]… [--finalize-data-json JSON] -o M
+humsub submit-manifest --manifest M --payload P|builtin:container [--stage N=PATH]… [--stage-exclude N=PATTERN]…
         [--run-name NAME] [--wait] [--retries R] [--tasks-per-job K] [--parallel-jobs J] [--dry-run]
         [--no-resubmit] [--time T] [--account A] [--partition P] [--reservation R] [--mail M]
         [--max-hops H] [--nice N] [--signal-seconds S] [--grace-seconds G] [--sbatch-arg ARG]… [--skip-path-checks]
@@ -272,8 +324,9 @@ humsub doctor [--probe] [--check-path P]… [--manifest M] [--timeout S]    can 
 humsub help                                    same as --help
 ```
 
-`CHAIN` is the chain id or any of its Slurm job ids.  Any first argument that is not a subcommand is
-treated as `submit` (`humsub -- --epochs=3` ≡ `humsub submit -- --epochs=3`).
+`CHAIN` is the chain id or any of its Slurm job ids.  A first argument starting with `-` is shorthand for
+`submit` (`humsub -- --epochs=3` ≡ `humsub submit -- --epochs=3`); any other unknown word is an error (with a
+"did you mean" hint), so a typo or a command your installed version lacks never submits a job.
 
 ### Submit options in detail
 

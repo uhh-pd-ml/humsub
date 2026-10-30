@@ -142,6 +142,8 @@ def submit_manifest_run(
     cache_dir = Path(config["execution"]["cache_dir"])
     manifest = load_manifest(manifest_source)
     branches = len(manifest["branches"])
+    if manifest.get("finalize"):
+        raise ConfigError("this humsub version cannot run a manifest's finalize step yet; remove the finalize section")
 
     if not opts.wait and opts.parallel_jobs and branches > opts.parallel_jobs:
         raise ConfigError(

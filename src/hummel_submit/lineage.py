@@ -174,6 +174,22 @@ def _apply_overrides(config: dict[str, Any], overrides: dict[str, dict[str, Any]
     return merged
 
 
+def inherited_inputs(
+    base: dict[str, Any], stage_overrides: dict[str, Path] | None = None
+) -> tuple[dict[str, Path], dict[str, list[str]], Path]:
+    """Stage sources, stage excludes and frozen payload of a submission, for a follow-up submission (resume, finalize).
+
+    Stages are re-copied from their sources, so a renewed proxy (``stage_overrides``) is picked up."""
+    sources = {k: Path(v) for k, v in base["manifest_workflow"].get("stage_sources", {}).items()}
+    sources.update(stage_overrides or {})
+    excludes = {k: list(v) for k, v in base["manifest_workflow"].get("stage_excludes", {}).items()}
+    for name in list(excludes):
+        if name not in sources:
+            del excludes[name]
+    payload = Path(base.get("lineage", {}).get("payload") or base["manifest_workflow"]["payload"])
+    return sources, excludes, payload
+
+
 def resume(
     output_dir: Path,
     spec_path: Path,
@@ -218,12 +234,7 @@ def resume(
         opts_dict["supervisor_job"] = False
     opts = SubmitOptions.from_dict(opts_dict)
 
-    sources = {k: Path(v) for k, v in base["manifest_workflow"].get("stage_sources", {}).items()}
-    sources.update(stage_overrides or {})
-    excludes = {k: list(v) for k, v in base["manifest_workflow"].get("stage_excludes", {}).items()}
-    for name in list(excludes):
-        if name not in sources:
-            del excludes[name]
+    sources, excludes, payload = inherited_inputs(base, stage_overrides)
 
     sdir = spec_path.parent
     resume_dir = sdir / "resume"
@@ -237,7 +248,6 @@ def resume(
     root_spec_run = base["run_name"]
     suffix_base = root_spec_run.split("-resume")[0]
     run_name = f"{suffix_base}-resume{len(ov.submissions)}"
-    payload = Path(base.get("lineage", {}).get("payload") or base["manifest_workflow"]["payload"])
     print(f"[resume] resubmitting {len(subset['branches'])} of {ov.total} branches as run {run_name}")
     return submit_manifest_run(
         project_dir=Path(base["project_dir"]),

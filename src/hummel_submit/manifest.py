@@ -99,7 +99,34 @@ def load_manifest(path: Path) -> dict[str, Any]:
     }
     if hint:
         result["humsub"] = hint
+    if "finalize" in data:
+        result["finalize"] = _load_finalize(data["finalize"], normalized)
     return result
+
+
+def _load_finalize(fin: Any, branches: list[dict[str, Any]]) -> dict[str, Any]:
+    """The optional ``finalize`` step: one extra payload run once every branch is complete (e.g. a merge)."""
+    if not isinstance(fin, dict):
+        raise ManifestError("manifest finalize field must be an object")
+    unknown = set(fin) - {"data", "outputs"}
+    if unknown:
+        raise ManifestError(f"unknown manifest finalize field(s): {', '.join(sorted(unknown))}")
+    payload_data = fin.get("data", {})
+    if not isinstance(payload_data, dict):
+        raise ManifestError("manifest finalize data must be an object")
+    outputs = fin.get("outputs")
+    if not isinstance(outputs, list) or not outputs:
+        raise ManifestError("manifest finalize outputs must be a non-empty array (they mark the step as done)")
+    branch_outputs = {o for b in branches for o in b["outputs"]}
+    normalized: list[str] = []
+    for output in outputs:
+        if not isinstance(output, str) or not output or not Path(output).expanduser().is_absolute():
+            raise ManifestError(f"manifest finalize output must be an absolute path: {output!r}")
+        path = str(Path(output).expanduser())
+        if path in branch_outputs:
+            raise ManifestError(f"manifest finalize output {path} is also a branch output")
+        normalized.append(path)
+    return {"data": payload_data, "outputs": normalized}
 
 
 def freeze_manifest_workflow(
