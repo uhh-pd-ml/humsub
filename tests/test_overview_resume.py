@@ -44,7 +44,7 @@ def _make_submission(tmp_path: Path):
     source = tmp_path / "src"
     source.mkdir()
     (source / "new.txt").write_text("renewed")
-    params = {"humsub_spec": str(sdir / "submission.json"), "workflow": "slurm", "retries": 1, "tasks_per_job": 2,
+    params = {"humsub_spec": str(sdir / "submission.json"), "workflow": "hummel", "retries": 1, "tasks_per_job": 2,
               "parallel_jobs": 0, "job_workers": 1}
     spec = {
         "schema": 2, "submission_id": "sub1", "run_name": "run", "output_dir": str(out), "project_dir": str(tmp_path),
@@ -56,7 +56,7 @@ def _make_submission(tmp_path: Path):
         "config": _config(tmp_path),
     }
     _write(sdir / "submission.json", spec)
-    _write(sdir / "law" / "control" / "slurm_jobs_0To6.json", {
+    _write(sdir / "law" / "control" / "hummel_jobs_0To6.json", {
         "jobs": {"1": {"job_id": "cA", "branches": [0, 1]}, "2": {"job_id": "cB", "branches": [2, 3]},
                  "3": {"job_id": "cC", "branches": [4, 5]}},
         "unsubmitted_jobs": {}, "attempts": {"2": 1},
@@ -85,7 +85,7 @@ def test_overview_follows_law_jobs_not_old_chains(tmp_path: Path) -> None:
 
 def test_overview_counts_branches_law_has_not_submitted(tmp_path: Path) -> None:
     out, _, spec = _make_submission(tmp_path)
-    jobs = Path(spec["law_dir"]) / "control" / "slurm_jobs_0To6.json"
+    jobs = Path(spec["law_dir"]) / "control" / "hummel_jobs_0To6.json"
     data = json.loads(jobs.read_text())
     del data["jobs"]["3"]
     data["unsubmitted_jobs"] = {"3": [4, 5]}
@@ -93,6 +93,14 @@ def test_overview_counts_branches_law_has_not_submitted(tmp_path: Path) -> None:
     with _states():
         ov = overview.compute_overview(out, spec)
     assert (ov.active, ov.waiting, ov.missing) == (0, 2, [2, 3])
+
+
+def test_overview_reads_jobs_files_of_submissions_before_the_hummel_workflow_type(tmp_path: Path) -> None:
+    out, _, spec = _make_submission(tmp_path)
+    control = Path(spec["law_dir"]) / "control"
+    (control / "hummel_jobs_0To6.json").rename(control / "slurm_jobs_0To6.json")
+    with _states():
+        assert overview.compute_overview(out, spec).missing == [2, 3]
 
 
 def test_find_submission_by_id_prefix_and_run_name(tmp_path: Path) -> None:
@@ -120,7 +128,7 @@ def test_resume_resets_failed_jobs_applies_settings_and_requeues_the_supervisor(
     result, calls = _resume(out, spec_path, config_overrides={"slurm": {"time_limit": "04:00:00"}}, retries=2,
                             stage_overrides={"code": tmp_path / "src"})
     assert result.state == "progress" and "tick" in calls and calls["sup"] == "99"
-    jobs = json.loads((Path(spec["law_dir"]) / "control" / "slurm_jobs_0To6.json").read_text())
+    jobs = json.loads((Path(spec["law_dir"]) / "control" / "hummel_jobs_0To6.json").read_text())
     assert jobs["attempts"] == {"2": 0}                         # only the failed job; the running one is untouched
     new = json.loads(spec_path.read_text())
     assert new["config"]["slurm"]["time_limit"] == "04:00:00"   # used by every chain created from now on

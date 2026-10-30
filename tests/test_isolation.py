@@ -111,3 +111,14 @@ def test_gc_asks_which_to_clean(answer, picked) -> None:
 def test_gc_deletes_nothing_on_an_unclear_answer(answer) -> None:
     with pytest.raises(ConfigError, match="nothing deleted|cannot read"):
         cli._gc_ask(_groups(), lambda prompt: answer)
+
+
+def test_submissions_of_the_slurm_workflow_type_are_not_driven(tmp_path: Path) -> None:
+    """humsub <= 0.4 kept law's job data in slurm_jobs_*.json: a pass with the hummel type would resubmit everything."""
+    spec_path = _spec(tmp_path, law_dir=str(tmp_path / "sub1" / "law"))
+    control = tmp_path / "sub1" / "law" / "control"
+    control.mkdir(parents=True)
+    (control / "slurm_jobs_0To3.json").write_text("{}")
+    with patch("hummel_submit.slurm.live_job_ids", return_value=set()):
+        with pytest.raises(ConfigError, match="humsub <= 0.4"):
+            tick.ensure_lock_generation(spec_path)

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import luigi
 import pytest
-from law.contrib.slurm.workflow import SlurmWorkflowProxy
+from law.workflow.remote import BaseRemoteWorkflowProxy
 
 from hummel_submit import tick
 from hummel_submit.contrib.hummel.workflow import HummelWorkflowProxy
@@ -83,7 +83,7 @@ def test_retry_counter_is_seeded_from_persisted_attempts() -> None:
     proxy = HummelWorkflowProxy.__new__(HummelWorkflowProxy)
     proxy._job_retries = defaultdict(int)
     proxy.job_data = type("JD", (), {"attempts": {1: 2, 3: 1}})()
-    with patch.object(SlurmWorkflowProxy, "poll", lambda self: None):
+    with patch.object(BaseRemoteWorkflowProxy, "poll", lambda self: None):
         proxy.poll()
     assert dict(proxy._job_retries) == {1: 2, 3: 1}
 

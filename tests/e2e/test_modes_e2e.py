@@ -108,7 +108,7 @@ def test_wait_mode_retries_a_failed_branch(project):
     assert out.read_text() == "ok after retry"
     assert sorted(sub.chain_states().values()) == ["failed", "finished"]
     time.sleep(3)
-    assert project.queue().strip() == "", project.queue()
+    assert project.squeue().strip() == "", project.squeue()
 
 
 def test_wait_mode_without_retries_reports_failure(project):

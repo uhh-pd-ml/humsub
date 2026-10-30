@@ -51,6 +51,9 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.slow)
         if int(SUPERVISOR_INTERVAL) >= 60 and item.get_closest_marker("supervisor"):
             item.add_marker(pytest.mark.slow)
+    # Slow tests mostly wait for Slurm: start them first so that, with pytest-xdist, they overlap each other and the
+    # fast tests fill the gaps.
+    items.sort(key=lambda item: item.get_closest_marker("slow") is None)
 
 
 def pytest_configure(config):
@@ -60,9 +63,14 @@ def pytest_configure(config):
 
 
 class Project:
-    """A scratch project directory with its own config, output and cache dirs."""
+    """A scratch project directory with its own config, output and cache dirs.
 
-    def __init__(self, root: Path, cache: Path) -> None:
+    Every project submits under its own Slurm job name (the directory tag), so tests can run in
+    parallel (pytest-xdist): queue checks and the teardown only see this project's jobs.
+    """
+
+    def __init__(self, root: Path, cache: Path, job_name: str) -> None:
+        self.job_name = job_name
         self.dir = root / "project"
         self.out = root / "out"
         self.bulk = root / "bulk-scratch"       # per test: tests run in parallel and gc sweeps scratch roots
@@ -74,7 +82,7 @@ class Project:
 
     def configure(self, execution: dict | None = None, **slurm) -> None:
         values = {
-            "job_name": "e2e",
+            "job_name": self.job_name,
             "account": os.environ.get("HUMSUB_E2E_ACCOUNT", "testgrp_std"),
             "partition": os.environ.get("HUMSUB_E2E_PARTITION", "std"),
             "gpus": 0,
@@ -119,22 +127,14 @@ class Project:
             raise AssertionError(f"humsub {' '.join(args)} failed ({proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
         return proc
 
-    def job_ids(self) -> set[str]:
-        """Every Slurm job this test's submissions created: chain hops (incl. followers) and supervisor jobs."""
-        ids: set[str] = set()
-        hs = self.out / ".hummel-submit"
-        for path in list(hs.glob("chains/*/state.json")) + list(hs.glob("submissions/*/submission.json")):
-            try:
-                data = json.loads(path.read_text())
-            except (OSError, ValueError):
-                continue
-            ids |= {str(j) for j in data.get("jobs", []) + data.get("supervisor_job_ids", [])}
-        return ids
+    def squeue(self) -> str:
+        """This project's queued/running jobs (chains, followers, supervisor), one per line."""
+        return squeue(self.job_name)
 
-    def queue(self) -> str:
-        """squeue lines of this test's jobs only (tests run in parallel on one cluster)."""
-        mine = self.job_ids()
-        return "\n".join(line for line in squeue().splitlines() if line.split() and line.split()[0] in mine)
+    def cancel_jobs(self) -> None:
+        ids = [line.split()[0] for line in self.squeue().splitlines() if line.strip()]
+        if ids:
+            subprocess.run(["scancel", *ids], check=False)
 
     def logs(self) -> str:
         return "".join(p.read_text(errors="replace") for p in sorted((self.out / "logs").glob("*.log")))
@@ -166,7 +166,7 @@ class Project:
                 break
             if time.time() > deadline:
                 raise AssertionError(f"hop {hop} of {chain} did not get to {after!r} in {timeout}s: {state}\n"
-                                     f"{self.queue()}\n{self.logs()[-3000:]}")
+                                     f"{self.squeue()}\n{self.logs()[-3000:]}")
             time.sleep(1)
         subprocess.run(["scancel", "--batch", "--signal=USR1", str(job)], check=True, capture_output=True)
 
@@ -177,7 +177,7 @@ class Project:
             if needle in logs:
                 return logs
             if time.time() > deadline:
-                raise AssertionError(f"{needle!r} not in the logs after {timeout}s\n{self.queue()}\n{logs[-3000:]}")
+                raise AssertionError(f"{needle!r} not in the logs after {timeout}s\n{self.squeue()}\n{logs[-3000:]}")
             time.sleep(2)
 
     def submit_single(self, run: str, *args: str, **kw) -> "Submission":
@@ -222,12 +222,18 @@ class Submission:
             if states and not {"pending", "running"} & set(states.values()):
                 return states
             if time.time() > deadline:
-                raise AssertionError(f"chains still active after {timeout}s: {states}\n{self.project.queue()}")
+                raise AssertionError(f"chains still active after {timeout}s: {states}\n{self.project.squeue()}")
             time.sleep(2)
 
 
-def squeue() -> str:
-    return subprocess.run(["squeue", "-h", "-o", "%i %T %j %E"], text=True, capture_output=True).stdout
+def squeue(job_name: str | None = None) -> str:
+    """The test user's queue; with *job_name*, only jobs named *job_name* or *job_name*-<suffix>."""
+    out = subprocess.run(["squeue", "-h", "-u", os.environ.get("USER", "testuser"), "-o", "%i %T %j %E"],
+                         text=True, capture_output=True).stdout
+    if job_name is None:
+        return out
+    return "".join(line + "\n" for line in out.splitlines()
+                   if len(line.split()) > 2 and (line.split()[2] == job_name or line.split()[2].startswith(job_name + "-")))
 
 
 def sacct_states(job_ids: list[str]) -> dict[str, str]:
@@ -252,8 +258,9 @@ def _tail(path: Path, lines: int = 40) -> str:
 
 def diagnostics(proj: "Project") -> str:
     """Everything needed to understand a failed e2e test from the CI log alone."""
-    parts = ["queue (this test's jobs):\n" + proj.queue(),
-             "sacct:\n" + subprocess.run(["sacct", "-X", "-n", "-o", "JobID,JobName,State,ExitCode,Elapsed,Timelimit,Start,End"],
+    parts = ["queue (this test):\n" + proj.squeue(),
+             "sacct:\n" + subprocess.run(["sacct", "-X", "-n", f"--name={proj.job_name},{proj.job_name}-supervisor",
+                                           "-o", "JobID,JobName,State,ExitCode,Elapsed,Timelimit,Start,End"],
                                           text=True, capture_output=True).stdout]
     for state in sorted((proj.out / ".hummel-submit" / "chains").glob("*/state.json")):
         try:
@@ -275,15 +282,12 @@ def project(request):
     tag = f"e2e-{uuid.uuid4().hex[:8]}"
     root = beegfs / tag
     cache = ssd / ".hummel-submit" / tag
-    proj = Project(root, cache)
+    proj = Project(root, cache, job_name=tag)
     yield proj
     rep = getattr(request.node, "rep_call", None)
     if rep is not None and rep.failed:
         sys.stderr.write(f"\n===== e2e diagnostics for {request.node.name} =====\n{diagnostics(proj)}\n=====\n")
-    # only this test's jobs: the others run in parallel on the same cluster
-    mine = sorted(proj.job_ids())
-    if mine:
-        subprocess.run(["scancel", *mine], check=False, capture_output=True)
+    proj.cancel_jobs()       # only this project's jobs: other tests may run in parallel
     if not request.config.getoption("--keep-e2e", default=False):
         shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(cache, ignore_errors=True)

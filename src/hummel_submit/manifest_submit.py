@@ -297,7 +297,7 @@ def submit_manifest_run(
             from .tick import instantiate
         except ImportError as exc:
             raise ConfigError(
-                "law (master) is required for manifest submission; reinstall hummel-submit with its dependencies"
+                "law is required for manifest submission; reinstall hummel-submit with its dependencies"
             ) from exc
 
         # Without --wait only the branches can start now; the passes take it from there.  A waiting controller

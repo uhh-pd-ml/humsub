@@ -60,14 +60,14 @@ def _wait_for(path: Path, timeout: int, project, what: str) -> None:
     deadline = time.time() + timeout
     while not path.exists() and time.time() < deadline:
         time.sleep(5)
-    assert path.exists(), f"{what}\n{project.queue()}\n{_logs(project)[-3000:]}"
+    assert path.exists(), f"{what}\n{project.squeue()}\n{_logs(project)[-3000:]}"
 
 
 def _wait_for_log(project, needle: str, timeout: int) -> None:
     deadline = time.time() + timeout
     while needle not in _logs(project) and time.time() < deadline:
         time.sleep(5)
-    assert needle in _logs(project), f"{needle!r} not in the logs\n{project.queue()}\n{_logs(project)[-3000:]}"
+    assert needle in _logs(project), f"{needle!r} not in the logs\n{project.squeue()}\n{_logs(project)[-3000:]}"
 
 
 @pytest.mark.supervisor

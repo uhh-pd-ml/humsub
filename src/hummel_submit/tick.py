@@ -39,7 +39,7 @@ def manifest_law_task(
         "class": cls,
         "params": {
             "humsub_spec": str(spec_path),
-            "workflow": "slurm",
+            "workflow": "hummel",
             "retries": int(opts.get("retries") or 0),
             "tasks_per_job": int(opts.get("tasks_per_job", 1)),
             "parallel_jobs": int(opts.get("parallel_jobs", 0)),
@@ -63,6 +63,14 @@ def ensure_lock_generation(spec_path: Path) -> None:
     spec = load_submission_spec(spec_path)
     if int(spec.get("control_lock", 0)) >= CONTROL_LOCK_GENERATION:
         return
+    control = Path(spec.get("law_dir", spec_path.parent / "law")) / "control"
+    if list(control.glob("slurm_jobs_*.json")) and not list(control.glob("hummel_jobs_*.json")):
+        # humsub <= 0.4 ran law with the slurm workflow type: a pass with the hummel type would not find law's job
+        # data and submit every incomplete branch again, next to chains that may still be running
+        raise ConfigError(
+            "this submission was made with humsub <= 0.4 (law job data in slurm_jobs_*.json); drive it with the humsub "
+            "version that made it, or resubmit its manifest (branches whose outputs exist are skipped)"
+        )
     alive = live_job_ids() & {str(j) for j in spec.get("supervisor_job_ids", [])}
     if alive:
         raise ConfigError(

@@ -209,7 +209,7 @@ class ManifestFinalizeWorkflow(ManifestPayloadWorkflow):
         reqs["branches"] = instantiate(self._workflow()["branch_task"])
         return reqs
 
-    def slurm_output_directory(self):
+    def hummel_output_directory(self):
         # law names jobs files after the branch range only: keep them apart from the branch workflow's
         return LocalDirectoryTarget(str(Path(self._spec()["law_dir"]) / "control" / "finalize"))
 

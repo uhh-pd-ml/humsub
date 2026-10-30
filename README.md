@@ -39,7 +39,7 @@ Needs Python ≥ 3.11 and `rsync` (present on Hummel).  Install software under `
 
 ```bash
 python3 -m venv "$USW/venvs/hummel-submit"
-"$USW/venvs/hummel-submit/bin/pip" install .          # also installs law (master branch) from GitHub
+"$USW/venvs/hummel-submit/bin/pip" install .          # also installs law (pinned commit, see pyproject.toml) from GitHub
 mkdir -p "$HOME/.local/bin"
 ln -sf "$USW/venvs/hummel-submit/bin/humsub" "$HOME/.local/bin/humsub"
 humsub --version
@@ -490,7 +490,7 @@ The same in every mechanism, because it is defined by the manifest, not by the c
 
 The dependency logic is law's own: the submission records its top task (`law_task` in `submission.json`), and a pass
 is nothing but `luigi.build` of that task with every `HummelWorkflow` in `no_poll` mode, so any law task graph built on
-`HummelWorkflow` can be driven this way.  law's jobs files (`<law_dir>/control/slurm_jobs_*.json`) are the record of
+`HummelWorkflow` can be driven this way.  law's jobs files (`<law_dir>/control/hummel_jobs_*.json`; `slurm_jobs_*.json` before 0.5) are the record of
 which chain each job currently runs on and how many retries it used; `humsub submission-status` reads them (done / in
 flight / not yet submitted / failed branches, and every failed job with its retries).
 
@@ -610,13 +610,34 @@ humsub submit-manifest
         runs the law job script; on SIGUSR1 (signal_seconds before the limit) it writes continue-<hop>,
         SIGTERMs the payload group and exits 0; a follower queued with `afterany` starts the next hop
         only if that marker exists; on success/failure the follower is cancelled
-  → law sees only the stable chain id (pending / running / finished / failed)
+  → law sees only the stable chain id (pending / running / finished / failed); a failing squeue/sacct is
+    retried and reported as an error, never as a failed chain
 ```
 
 Each chain stores a ZIP snapshot of the worker code, so upgrading the package cannot change a running
 chain.  law and the chain run in the Hummel host environment; the payload decides about containers.
 Custom law workflows can inherit `hummel_submit.contrib.hummel.HummelWorkflow` directly; independent
 branches should prefer manifest mode.  The law integration is isolated in `hummel_submit/contrib/hummel`.
+
+`HummelWorkflow` is its own law workflow type, `hummel` (since 0.5; before it was a `SlurmWorkflow`).  Its hooks
+are named `hummel_*` and mirror law's `slurm_*` hooks where they make sense for chains, so one task can offer
+several backends and pick one with `--workflow`:
+
+```python
+class MyTask(HummelWorkflow, law.slurm.SlurmWorkflow, law.LocalWorkflow):
+    ...  # --workflow hummel | slurm | local
+```
+
+law's `slurm_*` parameters and `[job] slurm_*` options do not apply to `hummel`; account, partition and time limit
+come from the humsub configuration.  `HummelJobManager` retries failed scheduler interactions (submit, status query,
+cancel) like law's own managers; the defaults come from law's `[job]` config section:
+
+```ini
+[job]
+hummel_manager_threads: 4
+hummel_manager_retries: 1
+hummel_manager_retry_delay: 5
+```
 
 ## Single-command mode
 
@@ -629,42 +650,17 @@ are checked for writability before submission.  Per-submission overrides: `--tim
 ## Development
 
 ```bash
-pip install pytest && PYTHONPATH=src python -m pytest -q        # scheduler-independent unit tests
+pip install -e . pytest && python -m pytest -q tests --ignore=tests/e2e   # unit tests, no cluster needed (~15 s)
+tests/e2e/run.sh                              # end-to-end against a real Slurm (Docker), fast profile (~2-3 min)
+E2E_PROFILE=realistic tests/e2e/run.sh        # the same with Hummel's timing: real time limits, 60 s passes (~7 min)
 ```
 
-A real end-to-end test needs Slurm: run `examples/hello/run.sh` on a frontend.
+The end-to-end tests run in the Docker image from [hummel-slurm-ci](https://github.com/uhh-pd-ml/hummel-slurm-ci),
+a Slurm configured like Hummel-2, and submit real manifests, chains, failures, retries, supervisor passes, finalize
+steps, cancellations and pre-timeout continuations; on a real frontend, `examples/hello/run.sh` is a quick check.  See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the test options and profiles, how to write parallel-safe and fast e2e tests,
+compatibility rules and how to move to a newer law.
 
-## Tests
+## License
 
-```bash
-python -m pytest tests --ignore=tests/e2e     # unit tests, no cluster needed (~15 s)
-tests/e2e/run.sh                              # end-to-end against a real Slurm configured like Hummel-2 (fast profile)
-E2E_PROFILE=realistic tests/e2e/run.sh        # the same with Hummel's timing (real time limits, 60 s passes)
-tests/e2e/run.sh -k finalize -x               # any pytest arguments
-```
-
-The end-to-end tests run inside the Docker image from
-[hummel-slurm-ci](https://github.com/uhh-pd-ml/hummel-slurm-ci) (Slurm 24.11 with Hummel's partitions,
-accounts, submit filter and `/sw/batch/init.sh`); they submit real manifests, chains, failures, retries,
-supervisor passes, finalize steps, cancellations and pre-timeout continuations.
-
-Almost all of their time is waiting for Slurm, so they are built to wait as little as possible:
-
-* **in parallel** (`pytest-xdist`, `E2E_WORKERS`, default 6): every test cancels only its own jobs (never
-  `scancel -u`), uses its own output, cache and scratch directories, and checks only its own queue entries;
-* **two profiles** (`E2E_PROFILE`).  `fast` (default; every push and PR in CI): the image's fast scheduler loop, supervisor
-  passes every 5 s (`HUMSUB_MIN_SUPERVISOR_INTERVAL` lowers humsub's 60 s floor for the tests only), and tests marked
-  `deadline` send the pre-timeout signal themselves (`project.reach_deadline()`: `scancel --batch --signal=USR1`, what
-  slurmctld sends) instead of waiting for real time limits.  `realistic` (weekly, on `main` and by hand in CI): Hummel's
-  scheduler timing, real time limits and 60 s passes; `deadline` and `supervisor` tests are then marked `slow`;
-* **no fixed sleeps**: wait for a condition (`project.wait_for_log()`, files) with a generous timeout;
-* `--durations=0` and `[run.sh] Ns: ...` lines show where the time goes.
-
-A new test that needs a hop to run out of time uses `project.configure_deadline(...)` and `project.reach_deadline(chain,
-hop, after=...)`, where `after` is a line *the payload* prints (the worker installs its signal handler only right before
-it starts the payload).
-
-Set `WHEELHOUSE=dir` to install from local wheels when the container has no network.  Without `WHEELHOUSE`, `run.sh`
-builds a wheelhouse on the *host* once (`~/.cache/humsub-e2e-wheelhouse`, needs `pip` and network) because the container
-usually has no working DNS; `NO_WHEELHOUSE=1` installs from the network inside the container instead.  `IMAGE=` selects
-the image; by default a locally available `hummel-slurm-ci:latest` is used, else the one on ghcr.io.
+humsub is licensed under the [BSD 3-Clause License](LICENSE).

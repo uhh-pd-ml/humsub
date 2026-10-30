@@ -158,7 +158,7 @@ def test_resume_grants_failed_jobs_new_retries_in_the_same_submission(project):
     deadline = time.time() + 150
     while not outs[1][0].exists() and time.time() < deadline:
         time.sleep(3)
-    assert outs[1][0].exists(), f"law did not resubmit the failed job\n{project.queue()}\n{_logs(project)[-2000:]}"
+    assert outs[1][0].exists(), f"law did not resubmit the failed job\n{project.squeue()}\n{_logs(project)[-2000:]}"
     assert outs[0][0].read_text() == done_before, "branches that were done are not redone"
     time.sleep(5)
     summary = project.humsub("submission-status", first.id, check=True).stdout
@@ -316,7 +316,7 @@ def test_supervisor_passes_retry_a_failed_job_without_a_controller(project):
     deadline = time.time() + 420
     while not out.exists() and time.time() < deadline:
         time.sleep(5)
-    assert out.exists(), f"the supervisor's pass did not retry the job\n{project.queue()}\n{_logs(project)[-2000:]}"
+    assert out.exists(), f"the supervisor's pass did not retry the job\n{project.squeue()}\n{_logs(project)[-2000:]}"
     project.wait_for_log("pass complete -> done", 120)  # the next pass finds the top task complete
     summary = project.humsub("submission-status", sub.id, check=True).stdout
     assert "1 done" in summary and "0 failed" in summary
@@ -349,7 +349,7 @@ def test_lanes_and_law_retries_work_together(project):
     deadline = time.time() + 420
     while not all(o[0].exists() for o in outs.values()) and time.time() < deadline:
         time.sleep(5)
-    assert all(o[0].exists() for o in outs.values()), f"{project.queue()}\n{_logs(project)[-3000:]}"
+    assert all(o[0].exists() for o in outs.values()), f"{project.squeue()}\n{_logs(project)[-3000:]}"
     spans = sorted(json.loads(o[0].read_text()) for o in outs.values())
     assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:])), f"lanes overlapped: {spans}"
     status = project.humsub("submission-status", sub.id, check=True).stdout

@@ -1,15 +1,17 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hummel-submit"
-version = "0.5.0"
+version = "0.6.0"
 description = "Law-backed Hummel-2 submission frontend with autonomous Slurm job chains"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 dependencies = [
-  "law @ git+https://github.com/riga/law.git@master",
+  "law @ git+https://github.com/riga/law.git@0a26fc508104a5ea389045d844bed5685c28d5d0",
 ]
 authors = [
   {name = "Kasieczka group"},

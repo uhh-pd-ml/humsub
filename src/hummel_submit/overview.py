@@ -1,6 +1,6 @@
 """Where a submission stands, read from law's jobs files (the source of truth) and the chain states.
 
-law keeps one jobs file per workflow (``<law_dir>/control/slurm_jobs_*.json``; the finalize workflow's under
+law keeps one jobs file per workflow (``<law_dir>/control/hummel_jobs_*.json``; the finalize workflow's under
 ``control/finalize``): job number -> current chain id, branches, last polled status, and the retries used
 (``attempts``).  A resubmitted job points at its new chain, so older chains of the same job are history only.
 """
@@ -66,7 +66,9 @@ def submission_manifest(spec: dict[str, Any]) -> dict[str, Any]:
 
 def jobs_files(spec: dict[str, Any], *, finalize: bool = False) -> list[Path]:
     control = Path(spec.get("law_dir", "")) / "control"
-    return sorted((control / "finalize" if finalize else control).glob("slurm_jobs_*.json"))
+    directory = control / "finalize" if finalize else control
+    # submissions made before the "hummel" workflow type (humsub 0.4) have law's job data in slurm_jobs_*.json
+    return sorted(directory.glob("hummel_jobs_*.json")) + sorted(directory.glob("slurm_jobs_*.json"))
 
 
 def jobs_in_file(path: Path) -> tuple[list[LawJob], int]:

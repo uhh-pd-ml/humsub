@@ -83,7 +83,7 @@ def test_two_projects_with_supervisors_and_a_forced_gc_do_not_interfere(project)
         time.sleep(5)
     for name, files in outs.items():
         for f in files:
-            assert f.exists(), f"{name}: {f} missing (scratch deleted while running?)\n{project.queue()}"
+            assert f.exists(), f"{name}: {f} missing (scratch deleted while running?)\n{project.squeue()}"
             assert f.read_text() == subs[name]
 
     # each supervisor ends on its own, and only ever dealt with its own submission

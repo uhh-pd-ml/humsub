@@ -45,13 +45,13 @@ def test_freeze_writes_the_finalize_context(tmp_path: Path) -> None:
 
 def test_finalize_workflow_requires_the_branch_workflow(tmp_path: Path) -> None:
     spec_path = _frozen(tmp_path)
-    fin = ManifestFinalizeWorkflow(humsub_spec=str(spec_path), workflow="slurm", retries=2, tasks_per_job=1)
+    fin = ManifestFinalizeWorkflow(humsub_spec=str(spec_path), workflow="hummel", retries=2, tasks_per_job=1)
     assert list(fin.create_branch_map()) == [0]
     assert fin.create_branch_map()[0]["outputs"] == [str(tmp_path / "merged")]
     branches = fin.workflow_requires()["branches"]
     assert type(branches) is ManifestPayloadWorkflow
     assert branches.tasks_per_job == 2 and branches.retries == 2 and branches.humsub_spec == str(spec_path)
-    assert fin.slurm_output_directory().path.endswith("/law/control/finalize")
+    assert fin.hummel_output_directory().path.endswith("/law/control/finalize")
     label, context = fin.req(fin, branch=0)._branch_context(json.loads(spec_path.read_text())["manifest_workflow"])
     assert label == "finalize" and context.name == "finalize.json"
 
@@ -60,7 +60,7 @@ def test_finalize_state_line(tmp_path: Path) -> None:
     spec_path = _frozen(tmp_path)
     spec = json.loads(spec_path.read_text())
     assert overview.finalize_state(spec).startswith("waiting for the branches")
-    _write(Path(spec["law_dir"]) / "control" / "finalize" / "slurm_jobs_0To1.json",
+    _write(Path(spec["law_dir"]) / "control" / "finalize" / "hummel_jobs_0To1.json",
            {"jobs": {"1": {"job_id": "cF", "status": None}}, "attempts": {"1": 1}})
     with patch.object(overview, "query_chain", return_value=ChainStatus("cF", "running")):
         assert overview.finalize_state(spec) == "chain cF running (1 retry used)"

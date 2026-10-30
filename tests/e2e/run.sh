@@ -12,20 +12,21 @@
 #                   themselves instead of waiting for real time limits, supervisor passes every 5 s.  For every push.
 #   realistic       Hummel-2's scheduler timing, real time limits (Slurm's own clock delivers the signal), Hummel's
 #                   60 s supervisor floor.  Catches timing assumptions the fast profile cannot; weekly and on main.
-# The tests run in parallel (pytest-xdist, E2E_WORKERS, default 6): almost all of their time is waiting for
-# Slurm, and every test cancels only its own jobs and uses its own directories.  --durations=0 reports where the
-# time went.
+# Tests run in parallel (pytest-xdist, E2E_WORKERS): almost all of their time is waiting for Slurm.  Every test
+# submits under its own Slurm job name, so tests only see and cancel their own jobs, and uses its own directories.
+# --durations=0 and the "[run.sh] Ns:" lines report where the time went.
 #
 # Environment:
 #   IMAGE            image to use (default ghcr.io/uhh-pd-ml/hummel-slurm-ci:latest)
-#   WHEELHOUSE       directory of wheels (law, luigi, pytest, setuptools, wheel and
+#   WHEELHOUSE       directory of wheels (law, luigi, pytest, pytest-xdist, setuptools, wheel and
 #                    their dependencies); installs offline from it instead of from
 #                    the network.  If unset, one is built on the *host* (which has network)
-#                    into ${XDG_CACHE_HOME:-~/.cache}/humsub-e2e-wheelhouse on first use and
-#                    re-used afterwards -- containers usually have no working DNS.
+#                    into ${XDG_CACHE_HOME:-~/.cache}/humsub-e2e-wheelhouse-<law commit> on first
+#                    use and re-used afterwards -- containers usually have no working DNS.
 #                    NO_WHEELHOUSE=1 installs from the network inside the container instead.
 #   E2E_PROFILE      fast (default) | realistic, see above
-#   E2E_WORKERS      parallel test workers (default 6; 0 = one after another)
+#   E2E_WORKERS      parallel pytest workers (default 6; 0 = serial).  The simulated cluster has 16 CPUs in `std`;
+#                    many more workers make hops queue and, with real time limits, slow tests time out.
 #   DOCKER_RUN_FLAGS extra `docker run` flags, e.g. --cpus=2 to mimic a small CI runner
 #   KEEP_CONTAINER=1 leave the container running afterwards (docker exec -u testuser ...)
 #   COVERAGE=1       measure coverage of hummel_submit in *all* processes (law, chain
@@ -41,14 +42,18 @@ if [ -z "${IMAGE:-}" ]; then
     else IMAGE=ghcr.io/uhh-pd-ml/hummel-slurm-ci:latest; fi
 fi
 # the wheelhouse: build it on the host once (see above)
+# law exactly as pinned in pyproject.toml; the wheelhouse is keyed by the pinned commit
+LAW_REQ=$(sed -n 's/^ *"\(law @ [^"]*\)",*$/\1/p' pyproject.toml)
+[ -n "$LAW_REQ" ] || { echo "no law requirement found in pyproject.toml"; exit 1; }
 if [ -z "${WHEELHOUSE:-}" ] && [ "${NO_WHEELHOUSE:-0}" != 1 ]; then
-    WHEELHOUSE="${XDG_CACHE_HOME:-$HOME/.cache}/humsub-e2e-wheelhouse"
-    if [ -z "$(ls -A "$WHEELHOUSE" 2>/dev/null)" ]; then
-        echo "building the wheelhouse in $WHEELHOUSE (once) ..."
+    WHEELHOUSE="${XDG_CACHE_HOME:-$HOME/.cache}/humsub-e2e-wheelhouse-${LAW_REQ##*@}"
+    WHEELS=("$LAW_REQ" pytest pytest-xdist setuptools wheel coverage)
+    # (re)build when the wanted set changed, e.g. after adding a test dependency
+    if [ "$(cat "$WHEELHOUSE/.requirements" 2>/dev/null)" != "${WHEELS[*]}" ]; then
+        echo "building the wheelhouse in $WHEELHOUSE ..."
         mkdir -p "$WHEELHOUSE"
-        python3 -m pip wheel -q -w "$WHEELHOUSE" "law @ git+https://github.com/riga/law.git@master" pytest pytest-xdist setuptools wheel coverage
-    elif ! ls "$WHEELHOUSE"/pytest_xdist-*.whl >/dev/null 2>&1; then
-        python3 -m pip wheel -q -w "$WHEELHOUSE" pytest-xdist     # wheelhouses from before parallel tests
+        python3 -m pip wheel -q -w "$WHEELHOUSE" "${WHEELS[@]}"
+        echo "${WHEELS[*]}" > "$WHEELHOUSE/.requirements"
     fi
 fi
 NAME="${CONTAINER_NAME:-humsub-e2e}"
