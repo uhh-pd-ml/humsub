@@ -9,6 +9,7 @@ Template fields: ``{stem}``, ``{name}``, ``{parent}`` of the input file and ever
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -16,10 +17,27 @@ from typing import Any
 from .config import ConfigError
 
 
+def _walk(root: Path, pattern: str, include_hidden: bool):
+    """Regular files below *root* whose path relative to it matches *pattern* (from the right, like Path.match).
+    Hidden files and folders (name starts with ".") are skipped unless *include_hidden*: they hold partial
+    downloads and tool state (rsync's .rsync-partial, editors' swap files) that must never become inputs."""
+    for folder, dirs, names in os.walk(root, followlinks=True):
+        if not include_hidden:
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in names:
+            if not include_hidden and name.startswith("."):
+                continue
+            path = Path(folder) / name
+            if path.relative_to(root).match(pattern) and path.is_file():
+                yield path
+
+
 def find_inputs(
-    search: list[Path], pattern: str = "*", *, require: str | None = None, select: str | None = None
+    search: list[Path], pattern: str = "*", *, require: str | None = None, select: str | None = None,
+    include_hidden: bool = False,
 ) -> tuple[list[Path], int]:
-    """(selected files, number found): every regular file below *search* matching the glob *pattern*.
+    """(selected files, number found): every regular file below *search* matching the glob *pattern*, not counting
+    hidden files and files in hidden folders unless *include_hidden*.
 
     ``require``: every file name found must fullmatch it, else stop (an unexpected file is a problem to look at,
     not something to skip).  ``select``: only the file names that fullmatch it are returned."""
@@ -27,7 +45,7 @@ def find_inputs(
     for root in search:
         if not root.is_dir():
             raise ConfigError(f"--search {root}: not a folder")
-        found.update(p.resolve() for p in root.rglob(pattern) if p.is_file())
+        found.update(p.resolve() for p in _walk(root, pattern, include_hidden))
     ordered = sorted(found)
     if require:
         bad = [p for p in ordered if not re.fullmatch(require, p.name)]

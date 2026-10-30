@@ -133,6 +133,9 @@ humsub make-manifest --search /beegfs/.../raw --glob '*.parquet' \
 
 * every file below `--search` matching `--glob` must fullmatch `--require` (else it stops: an unexpected file is a problem to
   look at, not something to skip); of those, the ones matching `--select` become inputs;
+* hidden files and everything in hidden folders (name starts with `.`) are never searched: that is where transfer tools keep
+  partial files (`.rsync-partial/`, `.xrootd-transfer/partials/`), often under the final file name.  `--include-hidden`
+  searches them too;
 * each input declares the `--output` templates (`{stem}`, `{name}`, `{parent}` of the input and every `--set` key); two inputs
   that would write the same output are an error;
 * `--files-per-branch K` packs K inputs into one branch (`data.inputs`): one payload run handles all of them.  Prefer this over
@@ -307,7 +310,7 @@ logs; `$SSD` for small-file/random I/O and caches (no backup; 100 GiB quota); `/
 ```text
 humsub init [--project-only | --user-only]     write config templates
 humsub config [--json]                         show resolved configuration
-humsub make-manifest --search DIR… [--glob G] [--require RE] [--select RE] --output TEMPLATE… [--files-per-branch K]
+humsub make-manifest --search DIR… [--glob G] [--include-hidden] [--require RE] [--select RE] --output TEMPLATE… [--files-per-branch K]
         [--set KEY=VALUE]… [--common FILE] [--common-json JSON] [--finalize-output TEMPLATE]… [--finalize-data-json JSON] -o M
 humsub submit-manifest --manifest M --payload P|builtin:container [--stage N=PATH]… [--stage-exclude N=PATTERN]…
         [--run-name NAME] [--wait] [--retries R] [--tasks-per-job K] [--parallel-jobs J] [--dry-run]
