@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import copy
 import json
 from pathlib import Path
 
-from hummel_submit.config import DEFAULTS
-from hummel_submit.stats import format_stats, lineage_job_ids, parse_elapsed, parse_sacct, summarize
+from hummel_submit.stats import format_stats, parse_elapsed, submission_job_ids, parse_sacct, summarize
 
 SACCT = """\
 100|das-ntuple|COMPLETED|2026-10-09T10:00:00|2026-10-09T10:05:00|2026-10-09T11:35:00|01:30:00|0:0|8|std
@@ -51,24 +49,12 @@ def test_report_lines_mention_the_headline_numbers() -> None:
         assert needle in text, needle
 
 
-def _spec(tmp: Path, sub_id: str, lineage: str | None, chains: list[str], supervisors: list[str]) -> dict:
-    cfg = copy.deepcopy(DEFAULTS)
-    sdir = tmp / ".hummel-submit" / "submissions" / sub_id
-    sdir.mkdir(parents=True)
-    spec = {"submission_id": sub_id, "run_name": sub_id, "output_dir": str(tmp), "chain_ids": chains, "config": cfg,
-            "supervisor_job_ids": supervisors, "lineage": {"id": lineage or sub_id}}
-    (sdir / "submission.json").write_text(json.dumps(spec))
-    return spec
-
-
-def test_lineage_job_ids_cover_resumes_chains_and_supervisors(tmp_path: Path) -> None:
+def test_submission_job_ids_cover_retried_chains_and_supervisors(tmp_path: Path) -> None:
     for chain, jobs in (("cA", ["10", "11"]), ("cB", ["12"]), ("cC", ["13"])):
         d = tmp_path / ".hummel-submit" / "chains" / chain
         d.mkdir(parents=True)
         (d / "state.json").write_text(json.dumps({"jobs": jobs}))
-    root = _spec(tmp_path, "20261009-100000-aaaaaaaa", None, ["cA", "cB"], ["90"])
-    _spec(tmp_path, "20261009-110000-bbbbbbbb", "20261009-100000-aaaaaaaa", ["cC"], [])
-    _spec(tmp_path, "20261009-120000-cccccccc", "other-lineage", ["cB"], ["91"])        # unrelated lineage must not leak in
-    ids, per_chain, chains = lineage_job_ids(tmp_path, root)
+    spec = {"submission_id": "s", "chain_ids": ["cA", "cB", "cC"], "supervisor_job_ids": ["90"]}
+    ids, per_chain, chains = submission_job_ids(tmp_path, spec)
     assert ids == ["10", "11", "12", "13", "90"]
     assert per_chain == {"cA": 2, "cB": 1, "cC": 1} and chains == 3

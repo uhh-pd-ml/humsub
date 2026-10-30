@@ -1,8 +1,9 @@
-"""Submit a manifest workflow: shared by ``submit-manifest``, ``resume`` and the supervisor job."""
+"""Submit a manifest workflow (``submit-manifest``); law passes (:mod:`hummel_submit.tick`) take it from there."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
 import math
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -20,11 +21,31 @@ from .cleanup import OWNER_MARKER
 from .tick import manifest_law_task
 
 
+def min_supervisor_interval() -> int:
+    """60 s: a supervisor job per minute is the most a production should cost the scheduler.  The end-to-end tests set
+    HUMSUB_MIN_SUPERVISOR_INTERVAL to run passes every few seconds (Slurm adds ~15 s to a delayed start anyway)."""
+    try:
+        return max(1, int(os.environ.get("HUMSUB_MIN_SUPERVISOR_INTERVAL", "60")))
+    except ValueError:
+        return 60
+
+
+def check_concurrency(parallel_jobs: int, max_concurrent: int) -> None:
+    """--parallel-jobs J limits how many chains exist in Slurm (law, per pass), --max-concurrent N how many run
+    (Slurm dependencies, at once).  Together they only make sense with J > N; otherwise the lanes never hold back."""
+    if parallel_jobs and max_concurrent and parallel_jobs <= max_concurrent:
+        raise ConfigError(
+            f"--parallel-jobs {parallel_jobs} <= --max-concurrent {max_concurrent}: --parallel-jobs limits how many "
+            "chains are in the queue, --max-concurrent how many of them run, so the lanes would never hold anything "
+            "back.  Use only one of them, or a --parallel-jobs well above --max-concurrent (see README: Concurrency)"
+        )
+
+
 @dataclass
 class SubmitOptions:
     tasks_per_job: int = 1
     wait: bool = False
-    retries: int = 0
+    retries: int | None = None      # None: not given (the supervisor then defaults to supervisor_max_rounds)
     parallel_jobs: int = 0
     retry_payload: int = 0
     safety_margin: float = 0.0
@@ -37,33 +58,37 @@ class SubmitOptions:
     ignore_quota_check: bool = False
 
     def validate(self) -> None:
-        if self.retries < 0 or self.parallel_jobs < 0 or self.retry_payload < 0 or self.max_concurrent < 0:
+        retries = self.retries or 0
+        if retries < 0 or self.parallel_jobs < 0 or self.retry_payload < 0 or self.max_concurrent < 0:
             raise ConfigError("retries, retry-payload, parallel-jobs and max-concurrent must be >= 0")
         if self.tasks_per_job < 1:
             raise ConfigError("tasks_per_job must be >= 1")
         if self.safety_margin < 0:
             raise ConfigError("--safety-margin must be >= 0")
-        if self.safety_margin > 0 and (self.retry_payload or self.retries):
+        if self.safety_margin > 0 and self.retry_payload:
             raise ConfigError(
-                "--safety-margin (retry hops queued in Slurm) is mutually exclusive with --retry-payload and --retries: "
-                "choose one retry mechanism"
+                "--safety-margin (retry hops queued in Slurm) is mutually exclusive with --retry-payload: "
+                "choose one in-chain retry mechanism (law --retries can be combined with either)"
             )
         if self.safety_margin > 0 and not self.resubmit:
             raise ConfigError("--safety-margin needs follower hops; it cannot be combined with --no-resubmit")
-        if not self.wait and not self.supervisor_job and self.retries:
+        if not self.wait and not self.supervisor_job and retries:
             raise ConfigError(
                 "--retries requires --wait or --supervisor-job: something must run law again to resubmit failed jobs"
             )
+        check_concurrency(self.parallel_jobs, self.max_concurrent)
         if self.scratch not in (None, "beegfs", "ssd"):
             raise ConfigError("--scratch must be 'beegfs' or 'ssd'")
-        if self.supervisor_job and (self.supervisor_interval < 60 or self.supervisor_max_rounds < 1):
-            raise ConfigError("--supervisor-interval must be >= 60 s and --supervisor-rounds >= 1")
+        floor = min_supervisor_interval()
+        if self.supervisor_job and (self.supervisor_interval < floor or self.supervisor_max_rounds < 1):
+            raise ConfigError(f"--supervisor-interval must be >= {floor} s and --supervisor-rounds >= 1")
 
     def law_retries(self) -> int:
         """law's resubmissions per failed job.  The supervisor's passes let law retry (``--supervisor-rounds`` times
-        unless ``--retries`` says otherwise); --safety-margin is the alternative, in-chain mechanism."""
-        if self.retries or self.wait or not self.supervisor_job or self.safety_margin > 0:
-            return self.retries
+        unless ``--retries`` says otherwise).  They nest with the in-chain mechanisms: law only sees a chain fail
+        once its --safety-margin hops (or --retry-payload attempts) are used up, and then starts a new chain."""
+        if self.retries is not None or self.wait or not self.supervisor_job:
+            return self.retries or 0
         return self.supervisor_max_rounds
 
     def failure_budget(self) -> int:
@@ -143,23 +168,20 @@ def submit_manifest_run(
     opts: SubmitOptions,
     skip_path_checks: bool = False,
     dry_run: bool = False,
-    lineage: dict[str, Any] | None = None,
-    parent_submission: str | None = None,
-    allow_supervisor: bool = True,
 ) -> dict[str, Any] | None:
     """Freeze and submit a manifest workflow; returns the submission spec (``None`` for dry runs/no-ops)."""
+    manifest = load_manifest(manifest_source)
+    branches = len(manifest["branches"])
+    finalize = manifest.get("finalize")
+    if finalize and not opts.wait and not opts.supervisor_job:
+        # the finalize workflow is submitted by a law pass once every branch is done: something must run those passes
+        # (switched on before validating: e.g. --retries is valid because of it)
+        opts.supervisor_job = True
+        print("[submit] note: the manifest has a finalize step, so the supervisor job (law passes) is switched on")
     opts.validate()
     check_signal_window(config, resubmit=opts.resubmit)
     output_dir = Path(config["execution"]["output_dir"])
     cache_dir = Path(config["execution"]["cache_dir"])
-    manifest = load_manifest(manifest_source)
-    branches = len(manifest["branches"])
-    finalize = manifest.get("finalize")
-    if finalize and not opts.wait and not opts.supervisor_job and allow_supervisor:
-        # the finalize workflow is submitted by a law pass once every branch is done: something must run those passes
-        opts.supervisor_job = True
-        opts.validate()
-        print("[submit] note: the manifest has a finalize step, so the supervisor job (law passes) is switched on")
 
     if not opts.wait and not opts.supervisor_job and opts.parallel_jobs and branches > opts.parallel_jobs:
         raise ConfigError(
@@ -233,7 +255,6 @@ def submit_manifest_run(
                 "max_concurrent": opts.max_concurrent,
                 "failure_budget": opts.failure_budget(),
                 "submit_options": opts.to_dict(),
-                "parent_submission": parent_submission,
             },
         )
         staged_root = cache_dir / "stages" / spec["submission_id"]
@@ -256,11 +277,6 @@ def submit_manifest_run(
                 "stage_excludes": stage_excludes,
             },
         )
-        spec["lineage"] = lineage or {
-            "id": spec["submission_id"],
-            "manifest": spec["manifest_workflow"]["manifest"],
-            "payload": spec["manifest_workflow"]["payload"],
-        }
         # The law tasks: the branch workflow and the top task that every supervisor pass re-instantiates identically
         # (hummel_submit.tick); with a finalize step the top task is the finalize workflow, which requires the branches.
         law_opts = dict(opts.to_dict(), retries=opts.law_retries())
@@ -309,8 +325,10 @@ def submit_manifest_run(
     else:
         print(f"[submit] submission  {spec['submission_id']}")
         print(f"[submit] all {branches} branches already have their outputs; only the finalize step is left")
-    if opts.supervisor_job and allow_supervisor:
+    if opts.supervisor_job:
+        from .locks import control_lock
         from .supervisor import submit_supervisor
-        job_id = submit_supervisor(spec_path, round_no=1)
+        with control_lock(spec_path, "submit-manifest"):     # supervisors are only ever queued under the lock
+            job_id = submit_supervisor(spec_path, round_no=1)
         print(f"[submit] supervisor  job {job_id} (first check in {opts.supervisor_interval}s)")
     return spec

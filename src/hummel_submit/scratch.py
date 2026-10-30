@@ -9,8 +9,8 @@ Two scratch tiers exist for every branch:
 
 Both directories are removed when the branch ends, also when it is interrupted by the pre-timeout
 signal.  Only a few small text files are kept for diagnosis (:func:`keep_small_files`); anything
-left behind by a killed job (SIGKILL, node failure) is swept by ``humsub resume`` / ``humsub gc``
-(:func:`stale_scratch_dirs`).
+left behind by a killed job (SIGKILL, node failure) is swept by ``humsub resume`` / ``humsub gc --stale-scratch``
+(:func:`sweep_stale_scratch`).
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ KEEP_MAX_FILE_BYTES = 1 << 20
 KEEP_MAX_FILES = 20
 RETRY_DURATION_SLACK = 1.2
 
-_SCRATCH_NAME_RE = re.compile(r"^(?P<job>[0-9]+|local)-(?P<branch>[0-9]+)$")
+_SCRATCH_NAME_RE = re.compile(r"^(?P<job>[0-9]+|local)-(?P<branch>[0-9]+|finalize)$")
 
 
 @dataclass(frozen=True)
@@ -140,8 +140,14 @@ def stale_scratch_dirs(
     roots: list[Path],
     live_jobs: set[str],
     submission_ids: set[str] | None = None,
+    *,
+    owner_uid: int | None = None,
 ) -> list[Path]:
-    """Scratch directories ``<root>/<submission>/<jobid>-<branch>`` whose Slurm job is not alive."""
+    """Scratch directories ``<root>/<submission>/<jobid>-<branch>`` whose Slurm job is not alive.
+
+    ``live_jobs`` must be the live jobs of *all* users (job ids are cluster-wide), and only directories owned by
+    ``owner_uid`` (default: the current user) are returned: scratch roots can be shared between projects and users."""
+    uid = os.getuid() if owner_uid is None else owner_uid
     stale: list[Path] = []
     for root in roots:
         if not root.is_dir():
@@ -151,6 +157,32 @@ def stale_scratch_dirs(
                 continue
             for entry in sorted(sub.iterdir()):
                 match = _SCRATCH_NAME_RE.match(entry.name)
-                if entry.is_dir() and match and match.group("job") not in live_jobs:
-                    stale.append(entry)
+                if not (entry.is_dir() and match) or match.group("job") in live_jobs:
+                    continue
+                try:
+                    if entry.stat().st_uid != uid:
+                        continue
+                except OSError:
+                    continue
+                stale.append(entry)
     return stale
+
+
+def scratch_roots(config: dict[str, Any]) -> list[Path]:
+    exe = config["execution"]
+    return [Path(exe["cache_dir"]) / "payload-work", Path(exe["bulk_scratch_dir"])]
+
+
+def sweep_stale_scratch(config: dict[str, Any], submission_ids: set[str] | None, *, apply: bool) -> tuple[int, int]:
+    """Remove scratch of Slurm jobs that are gone (killed, crashed, cancelled).  Returns (dirs, bytes).
+
+    Raises SlurmError (and removes nothing) when Slurm cannot be asked which jobs are alive."""
+    from .cleanup import _dir_size
+    from .slurm import live_job_ids
+
+    stale = stale_scratch_dirs(scratch_roots(config), live_job_ids(all_users=True), submission_ids)
+    total = sum(_dir_size(p) for p in stale)
+    if apply:
+        for path in stale:
+            shutil.rmtree(path, ignore_errors=True)
+    return len(stale), total

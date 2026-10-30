@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass, field
 import difflib
+import os
 from pathlib import Path
 import shlex
 import shutil
@@ -31,7 +33,7 @@ from .config import (
 from .pathcheck import PathCheckError, check_compute_writable, check_payload_args
 from .slurm import SlurmError, queue_status, sbatch_command, slurm_log_path
 from .state import chain_root, default_run_name, load_state
-from .submission import create_submission_spec, load_submission_spec, submission_root
+from .submission import create_submission_spec, load_submission_spec, require_owner, submission_root, submission_owner
 from .manifest import load_manifest
 from .manifest_submit import (
     SubmitOptions,
@@ -46,14 +48,7 @@ from .payloads import resolve as resolve_builtin_payload
 from .state import atomic_write_json
 from .prune import apply_plan, fmt as fmt_size, plan_submission, select_submissions as select_prune_submissions
 from .stats import format_stats, stats_for, to_json as stats_json
-from .lineage import (
-    compute_overview,
-    finalize_state,
-    find_submission,
-    format_overview,
-    resume as resume_lineage,
-    sweep_stale_scratch,
-)
+from .overview import compute_overview, finalize_state, find_submission, format_overview
 from .staging import parse_stage_exclude, parse_stage_spec, stage_inputs
 from .templates import PROJECT_TEMPLATE, USER_TEMPLATE
 
@@ -61,6 +56,12 @@ from .templates import PROJECT_TEMPLATE, USER_TEMPLATE
 def _add_slurm_options(parser: argparse.ArgumentParser) -> None:
     """Per-submission overrides of [slurm] settings (shared by submit and submit-manifest)."""
     parser.add_argument("--no-resubmit", action="store_true", help="no continuation hops: the job runs once, in a single Slurm job")
+    _add_slurm_overrides(parser)
+    parser.add_argument("--skip-path-checks", action="store_true", help="skip Hummel filesystem/path validation (escape hatch)")
+
+
+def _add_slurm_overrides(parser: argparse.ArgumentParser) -> None:
+    """[slurm] settings that can also be changed for the future chains of a running submission (resume)."""
     parser.add_argument("--time", dest="time_limit", help="time limit of each hop, e.g. 04:00:00")
     parser.add_argument("--account", help="Slurm account")
     parser.add_argument("--partition", help="Slurm partition")
@@ -78,11 +79,10 @@ def _add_slurm_options(parser: argparse.ArgumentParser) -> None:
              "--nice 0 deliberately removes the penalty when you need results now",
     )
     parser.add_argument("--sbatch-arg", action="append", default=[], help="extra sbatch option (repeatable), e.g. --sbatch-arg=--cpus-per-task=8")
-    parser.add_argument("--skip-path-checks", action="store_true", help="skip Hummel filesystem/path validation (escape hatch)")
 
 
 def _add_manifest_policy_options(parser: argparse.ArgumentParser) -> None:
-    """Retry, concurrency, scratch and supervision policy of a manifest submission (also used by resume)."""
+    """Retry, concurrency, scratch and supervision policy of a manifest submission."""
     parser.add_argument(
         "--retry-payload", type=int, default=None, metavar="N",
         help="re-run a failing payload up to N times inside the job; a retry is skipped when it cannot finish "
@@ -102,11 +102,12 @@ def _add_manifest_policy_options(parser: argparse.ArgumentParser) -> None:
         help="location of HUMSUB_SCRATCH (bulk per-branch scratch); default [execution].scratch = beegfs",
     )
     parser.add_argument("--supervisor-job", action="store_true", default=None,
-                        help="queue a tiny Slurm job that periodically resumes missing branches (no login-node process)")
+                        help="queue a tiny Slurm job that runs a law pass periodically (polls, retries failed jobs, "
+                             "submits what is ready; no login-node process)")
     parser.add_argument("--supervisor-interval", type=int, default=None, metavar="SECONDS",
-                        help="seconds between supervisor checks (default 1800)")
+                        help="seconds between supervisor passes (default 1800)")
     parser.add_argument("--supervisor-rounds", type=int, default=None, metavar="R",
-                        help="maximum resume rounds of the supervisor (default 3)")
+                        help="law retries per failed job when the supervisor runs and --retries is not given (default 3)")
     parser.add_argument("--ignore-quota-check", action="store_true", default=None,
                         help="skip the preflight estimate of the SSD footprint")
 
@@ -179,7 +180,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     manifest.add_argument("--run-name", help="unique run name (default: run-<timestamp>-<id>)")
     manifest.add_argument("--wait", action="store_true", help="keep law alive to poll and retry remote jobs")
-    manifest.add_argument("--retries", type=int, default=0, help="law failure retries per branch (requires --wait)")
+    manifest.add_argument(
+        "--retries", type=int, default=None, metavar="R",
+        help="law resubmissions per failed job (needs --wait or --supervisor-job; with the supervisor the default is "
+             "--supervisor-rounds, 0 disables retries)",
+    )
     manifest.add_argument(
         "--tasks-per-job", type=int, default=1,
         help="branches run one after another in one Slurm chain (default 1: one chain per branch)",
@@ -234,23 +239,23 @@ def _parser() -> argparse.ArgumentParser:
 
     resume = sub.add_parser(
         "resume",
-        help="re-submit only the branches of a submission (or its resumes) whose outputs are still missing",
+        help="continue a submission after its passes gave up: fresh retries for failed jobs, optional new settings for "
+             "future chains, one pass now, supervisor queued again",
     )
-    resume.add_argument("submission", help="submission id or run name of any submission of the lineage")
-    resume.add_argument("--dry-run", action="store_true", help="show what would be resubmitted; submit and delete nothing")
-    resume.add_argument("--include-active", action="store_true",
-                        help="also resubmit branches owned by chains that are still pending/running (normally skipped)")
+    resume.add_argument("submission", help="submission id or run name")
+    resume.add_argument("--dry-run", action="store_true", help="show what would change; change and submit nothing")
     resume.add_argument("--stage", action="append", default=[], metavar="NAME=PATH",
-                        help="override a stage source (e.g. a renewed proxy); stages are re-copied from their sources anyway")
-    resume.add_argument("--wait", action="store_true", default=None, help="keep law alive to poll and retry")
-    resume.add_argument("--retries", type=int, default=None, help="law retries (requires --wait)")
-    resume.add_argument("--tasks-per-job", type=int, default=None, help="branches per chain for the resubmission")
-    resume.add_argument("--parallel-jobs", type=int, default=None, help="rolling submission width (needs --wait)")
-    _add_slurm_options(resume)
-    _add_manifest_policy_options(resume)
+                        help="re-copy a stage from this source (e.g. a renewed proxy); other stages stay frozen")
+    resume.add_argument("--retries", type=int, default=None, metavar="R",
+                        help="law retries per failed job from now on (default: as submitted, at least 1)")
+    resume.add_argument("--parallel-jobs", type=int, default=None, metavar="J", help="at most J branch jobs in flight")
+    resume.add_argument("--supervisor-job", action="store_true", help="supervise the submission from now on")
+    resume.add_argument("--supervisor-interval", type=int, default=None, metavar="SECONDS",
+                        help="seconds between supervisor passes")
+    _add_slurm_overrides(resume)
 
     stats = sub.add_parser("stats", help="what a production cost: jobs, runtimes, core-hours, queue waits, failures, retries, peak concurrency")
-    stats.add_argument("submission", help="submission id or run name of any submission of the lineage")
+    stats.add_argument("submission", help="submission id or run name")
     stats.add_argument("--json", action="store_true", help="machine-readable output")
 
     prune = sub.add_parser(
@@ -260,7 +265,6 @@ def _parser() -> argparse.ArgumentParser:
     prune.add_argument("--run", action="append", default=[], metavar="NAME", help="run name (repeatable)")
     prune.add_argument("--id", action="append", default=[], metavar="PREFIX", help="submission id or prefix (repeatable)")
     prune.add_argument("--before", metavar="YYYY-MM-DD", help="all submissions created before this date")
-    prune.add_argument("--lineage", action="store_true", help="also select every submission derived from a selected one (resumes)")
     prune.add_argument("--apply", action="store_true", help="actually delete (default: show what would be deleted)")
     prune.add_argument("--force", action="store_true", help="also prune submissions that still look active")
 
@@ -285,8 +289,21 @@ def _parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--dry-run", action="store_true", help="only report what would be removed")
     cleanup.add_argument("--force", action="store_true", help="allow cleanup even when chains are still active")
 
-    gc = sub.add_parser("gc", help="garbage-collect old SSD submission caches")
-    gc.add_argument("--apply", action="store_true", help="actually delete; without this flag gc is a dry run")
+    gc = sub.add_parser(
+        "gc",
+        help="garbage-collect caches and scratch of your finished submissions: lists them per submission; "
+             "--apply asks which to delete, --submission names them, --force deletes all",
+    )
+    gc.add_argument("--apply", action="store_true",
+                    help="delete after asking which of the listed submissions to clean (needs a terminal)")
+    gc.add_argument("--submission", action="append", default=[], metavar="ID|RUN",
+                    help="clean exactly this submission (id, id prefix or run name; repeatable), without asking")
+    gc.add_argument(
+        "-f", "--force", action="store_true",
+        help="DANGER: delete everything listed, for every submission, without asking.  Caches and scratch cannot be "
+             "recovered; failed submissions lose the stages and scratch leftovers you may still need to debug or "
+             "resume them.  Only for scripts that know exactly what the output_dir and cache_dir contain",
+    )
     gc.add_argument("--stale-scratch", action="store_true",
                     help="also remove branch scratch (SSD and bulk) of Slurm jobs that no longer exist")
     gc.add_argument("--successful-after-hours", type=float, default=24.0)
@@ -595,12 +612,14 @@ def cmd_make_manifest(args: argparse.Namespace) -> int:
 
 
 def cmd_tick(args: argparse.Namespace) -> int:
-    from .tick import run_tick
+    from .tick import ensure_lock_generation, run_tick
 
     config, _ = load_config(Path.cwd(), require_command=False)
     output_dir = Path(config["execution"]["output_dir"])
     spec_path = find_submission(output_dir, args.submission)
-    result = run_tick(spec_path)
+    require_owner(spec_path, load_submission_spec(spec_path), "run a pass over")
+    ensure_lock_generation(spec_path)
+    result = run_tick(spec_path, "humsub tick")
     print(f"[tick] {result.state}")
     for error in result.errors:
         print(f"[tick]   {error}")
@@ -614,23 +633,28 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
-    config, _ = load_config(Path.cwd(), require_command=False)
-    output_dir = Path(config["execution"]["output_dir"])
-    spec_path = find_submission(output_dir, args.submission)
-    stage_overrides = _stage_map(args.stage) if args.stage else None
-    resume_lineage(
+    from .resume import resume
+    from .tick import ensure_lock_generation
+
+    output_dir, spec_path, spec = _submission_context(args.submission)
+    require_owner(spec_path, spec, "resume")
+    if not args.dry_run:
+        ensure_lock_generation(spec_path)
+    result = resume(
         output_dir,
         spec_path,
         config_overrides=_cli_overrides(args),
-        option_overrides=_option_overrides(args),
-        stage_overrides=stage_overrides,
+        retries=args.retries,
+        parallel_jobs=args.parallel_jobs,
+        stage_overrides=_stage_map(args.stage) if args.stage else None,
+        supervisor=args.supervisor_job,
+        supervisor_interval=args.supervisor_interval,
         dry_run=args.dry_run,
-        include_active=args.include_active,
     )
-    return 0
+    return 1 if result is not None and result.state == "failed" else 0
 
 
-def _lineage_context(ident: str) -> tuple[Path, Path, dict[str, Any]]:
+def _submission_context(ident: str) -> tuple[Path, Path, dict[str, Any]]:
     config, _ = load_config(Path.cwd(), require_command=False)
     output_dir = Path(config["execution"]["output_dir"])
     spec_path = find_submission(output_dir, ident)
@@ -638,12 +662,12 @@ def _lineage_context(ident: str) -> tuple[Path, Path, dict[str, Any]]:
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
-    output_dir, _, spec = _lineage_context(args.submission)
+    output_dir, _, spec = _submission_context(args.submission)
     summary = stats_for(output_dir, spec, str(spec["config"]["slurm"]["job_name"]))
     if args.json:
         print(stats_json(summary))
     else:
-        print(f"lineage {spec.get('lineage', {}).get('id', spec['submission_id'])} (run {spec['run_name']})")
+        print(f"submission {spec['submission_id']} (run {spec['run_name']})")
         for line in format_stats(summary):
             print(line)
     return 0
@@ -655,10 +679,8 @@ def cmd_prune(args: argparse.Namespace) -> int:
     config, _ = load_config(Path.cwd(), require_command=False)
     output_dir = Path(config["execution"]["output_dir"])
     chosen = select_prune_submissions(output_dir, args.run, args.before, args.id)
-    if args.lineage:
-        from .lineage import lineage_id, lineage_specs
-        lids = {lineage_id(load_submission_spec(p)) for p in chosen}
-        chosen = sorted({p for lid in lids for p, _ in lineage_specs(output_dir, lid)} | set(chosen))
+    for path in chosen:
+        require_owner(path, load_submission_spec(path), "prune")
     if not chosen:
         print("prune: nothing matches")
         return 0
@@ -833,6 +855,7 @@ def _print_cleanup_status(status, *, prefix: str = "") -> None:
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
     spec_path = _submission_spec_from_current_config(args.submission)
+    require_owner(spec_path, load_submission_spec(spec_path), "clean up")
     before = inspect_submission_cache(spec_path)
     _print_cleanup_status(before)
     if not before.cache_paths:
@@ -854,17 +877,95 @@ def cmd_gc(args: argparse.Namespace) -> int:
     config, _ = load_config(Path.cwd(), require_command=False)
     output_dir = Path(config["execution"]["output_dir"])
     cache_dir = Path(config["execution"]["cache_dir"])
-    specs = list(iter_submission_specs(output_dir))
+    groups, scanned, skipped_active, skipped_foreign = _gc_groups(config, args)
+
+    print(f"gc: output={output_dir}; cache={cache_dir}")
+    print(f"gc: scanned {scanned} submission(s); skipped {skipped_active} active and {skipped_foreign} of other users")
+    if not groups:
+        print("gc: nothing to clean")
+        return 0
+    for i, group in enumerate(groups, 1):
+        print(f"gc: [{i}] {group.describe()}")
+        for kind, path, nbytes in group.entries:
+            print(f"gc:       {kind:<8} {_format_bytes(nbytes):>10}  {path}")
+    print(f"gc: reclaimable {_format_bytes(sum(g.bytes for g in groups))}")
+
+    if args.force:
+        chosen = groups
+    elif args.submission:
+        chosen = _gc_select_named(groups, args.submission)
+    elif not args.apply:
+        print("gc: dry run; --apply asks which to clean, --submission ID cleans one, --force cleans all (see --help)")
+        return 0
+    elif not sys.stdin.isatty():
+        print("gc: not a terminal, so nothing is deleted without being named: use --submission ID (repeatable), "
+              "or --force for everything listed", file=sys.stderr)
+        return 2
+    else:
+        chosen = _gc_ask(groups, input)
+    if not chosen:
+        print("gc: nothing selected; nothing deleted")
+        return 0
+    for group in chosen:
+        group.remove()
+        print(f"gc: cleaned {group.key} ({_format_bytes(group.bytes)})")
+    print("gc: done; persistent submission metadata, outputs and logs were preserved")
+    return 0
+
+
+@dataclass
+class _GcGroup:
+    """What gc would remove for one submission (or the orphans): its cache after the retention time, and the scratch
+    of its dead Slurm jobs."""
+    key: str
+    label: str
+    spec_path: Path | None = None
+    cache: bool = False
+    entries: list[tuple[str, Path, int]] = field(default_factory=list)
+    scratch: list[Path] = field(default_factory=list)
+    orphans: list[Any] = field(default_factory=list)
+
+    @property
+    def bytes(self) -> int:
+        return sum(n for _, _, n in self.entries)
+
+    def describe(self) -> str:
+        return f"{self.key}  {self.label}  ({_format_bytes(self.bytes)})"
+
+    def remove(self) -> None:
+        if self.cache and self.spec_path is not None:
+            cleanup_submission_cache(self.spec_path, force=False, dry_run=False)
+        for path in self.scratch:
+            shutil.rmtree(path, ignore_errors=True)
+        remove_cache_paths(self.orphans)
+
+
+def _gc_groups(config: dict[str, Any], args: argparse.Namespace) -> tuple[list[_GcGroup], int, int, int]:
+    """(groups, scanned, skipped active, skipped of other users): only the current user's submissions and directories
+    are ever considered, wherever output_dir and cache_dir are shared."""
+    from .cleanup import _dir_size
+    from .scratch import scratch_roots, stale_scratch_dirs
+    from .slurm import live_job_ids
+
+    output_dir = Path(config["execution"]["output_dir"])
+    cache_dir = Path(config["execution"]["cache_dir"])
+    groups: dict[str, _GcGroup] = {}
+    labels: dict[str, tuple[str, Path]] = {}
     known_ids: set[str] = set()
-    candidates = []
-    skipped_active = 0
-    for spec_path in specs:
+    scanned = skipped_active = skipped_foreign = 0
+    for spec_path in iter_submission_specs(output_dir):
+        scanned += 1
         try:
+            spec = load_submission_spec(spec_path)
+            known_ids.add(spec["submission_id"])
+            if submission_owner(spec_path, spec)[0] != os.getuid():
+                skipped_foreign += 1
+                continue
+            labels[spec["submission_id"]] = (f"run={spec.get('run_name')} project={spec.get('project_dir')}", spec_path)
             status = inspect_submission_cache(spec_path)
         except Exception as exc:
             print(f"gc: WARNING: cannot inspect {spec_path}: {exc}", file=sys.stderr)
             continue
-        known_ids.add(status.submission_id)
         if status.active:
             skipped_active += 1
             continue
@@ -873,48 +974,78 @@ def cmd_gc(args: argparse.Namespace) -> int:
         age = status.terminal_age_hours or 0.0
         threshold = args.successful_after_hours if status.state == "successful" else args.failed_after_hours
         if age >= threshold:
-            candidates.append((spec_path, status))
-
-    mode = "APPLY" if args.apply else "DRY RUN"
-    print(f"gc: {mode}; output={output_dir}; cache={cache_dir}")
-    print(f"gc: scanned {len(specs)} submission(s), skipped {skipped_active} active submission(s)")
-    reclaim = 0
-    for _, status in candidates:
-        _print_cleanup_status(status, prefix="gc: ")
-        reclaim += sum(entry.bytes for entry in status.cache_paths)
-
-    orphan_entries = []
-    if args.orphans_after_hours is not None:
-        orphan_entries = stale_orphan_cache_dirs(
-            cache_dir, known_ids, older_than_hours=args.orphans_after_hours
-        )
-        for entry in orphan_entries:
-            print(f"gc: orphan {entry.label:<20} {_format_bytes(entry.bytes):>10}  {entry.path}")
-            reclaim += entry.bytes
+            group = groups.setdefault(status.submission_id, _GcGroup(status.submission_id, labels[status.submission_id][0], spec_path))
+            group.cache = True
+            group.entries += [(f"cache:{e.label}", e.path, e.bytes) for e in status.cache_paths]
 
     if args.stale_scratch:
-        count, nbytes = sweep_stale_scratch(config, None, apply=args.apply)
-        print(f"gc: stale scratch of dead jobs: {count} dir(s), {_format_bytes(nbytes)}")
-        if args.apply:
-            reclaim += 0
-        else:
-            reclaim += nbytes
+        for path in stale_scratch_dirs(scratch_roots(config), live_job_ids(all_users=True)):
+            sub_id = path.parent.name
+            label, spec_path = labels.get(sub_id, ("(submission not in this output_dir)", None))
+            group = groups.setdefault(sub_id, _GcGroup(sub_id, label, spec_path))
+            group.scratch.append(path)
+            group.entries.append(("scratch", path, _dir_size(path)))
 
-    print(f"gc: reclaimable {_format_bytes(reclaim)}")
-    if not args.apply:
-        print("gc: dry run; pass --apply to delete")
-        return 0
+    if args.orphans_after_hours is not None:
+        mine = [e for e in stale_orphan_cache_dirs(cache_dir, known_ids, older_than_hours=args.orphans_after_hours)
+                if _owned_by_me(e.path)]
+        if mine:
+            group = _GcGroup("orphans", "cache directories no submission of this output_dir refers to")
+            group.orphans = mine
+            group.entries = [(f"orphan:{e.label}", e.path, e.bytes) for e in mine]
+            groups["orphans"] = group
+    return sorted(groups.values(), key=lambda g: g.key), scanned, skipped_active, skipped_foreign
 
-    for spec_path, _ in candidates:
-        cleanup_submission_cache(spec_path, force=False, dry_run=False)
-    remove_cache_paths(orphan_entries)
-    print("gc: cleanup complete; persistent submission metadata, outputs and logs were preserved")
-    return 0
+
+def _owned_by_me(path: Path) -> bool:
+    try:
+        return Path(path).stat().st_uid == os.getuid()
+    except OSError:
+        return False
+
+
+def _gc_select_named(groups: list[_GcGroup], names: list[str]) -> list[_GcGroup]:
+    chosen: list[_GcGroup] = []
+    for name in names:
+        matches = [g for g in groups if g.key == name or g.key.startswith(name) or f"run={name} " in g.label + " "]
+        if not matches:
+            raise ConfigError(f"gc: {name!r} is not among the listed submissions")
+        if len(matches) > 1:
+            raise ConfigError(f"gc: {name!r} is ambiguous: {', '.join(g.key for g in matches)}")
+        if matches[0] not in chosen:
+            chosen.append(matches[0])
+    return chosen
+
+
+def _gc_ask(groups: list[_GcGroup], ask) -> list[_GcGroup]:
+    """Ask which of the listed groups to clean: numbers ("1,3", "2-4"), "all", or nothing."""
+    answer = ask(f"gc: clean which? numbers (e.g. 1,3 or 2-4), 'all', or Enter for none: ").strip().lower()
+    if not answer:
+        return []
+    if answer == "all":
+        return list(groups)
+    picked: list[_GcGroup] = []
+    for part in answer.replace(" ", "").split(","):
+        lo, _, hi = part.partition("-")
+        try:
+            numbers = range(int(lo), int(hi or lo) + 1)
+        except ValueError:
+            raise ConfigError(f"gc: cannot read {part!r}; nothing deleted") from None
+        for n in numbers:
+            if not 1 <= n <= len(groups):
+                raise ConfigError(f"gc: there is no [{n}]; nothing deleted")
+            if groups[n - 1] not in picked:
+                picked.append(groups[n - 1])
+    return picked
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
     path = _find_chain(args.chain)
     state = load_state(path)
+    if state.get("submission_id"):
+        spec_path = submission_root(Path(state["output_dir"])) / state["submission_id"] / "submission.json"
+        if spec_path.is_file():
+            require_owner(spec_path, load_submission_spec(spec_path), "cancel chains of")
     cancel_chain(Path(state["output_dir"]), state["chain_id"], reason="cancelled-by-user")
     print(f"marked chain {state['chain_id']} done and requested cancellation of {len(state['jobs'])} known job(s)")
     return 0

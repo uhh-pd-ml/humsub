@@ -105,7 +105,7 @@ humsub cleanup SUBMISSION_ID             # delete the staged inputs on the SSD o
   contract**: debug files, logs, and above all **checkpoints**.  humsub never counts them for completion, **never deletes them**
   (required outputs are wiped before every attempt and after every failure; extra outputs are not), never cleans them up, and lists
   them in the branch context (`"extra_outputs": [...]`).  Their paths are fixed in the manifest, so they are identical in every
-  submission of a lineage: a checkpoint written in one hop is found by the next hop, by a retry, by `humsub resume`, and by a later
+  attempt: a checkpoint written in one hop is found by the next hop, by a retry, after `humsub resume`, and by a later
   study that points at the same path (e.g. to continue training on more data).  Retention is the manifest author's decision.
 * `finalize` (optional) is a fan-in step that runs **once, after every branch is complete**, e.g. merging per-branch summaries:
 
@@ -118,7 +118,7 @@ humsub cleanup SUBMISSION_ID             # delete the staged inputs on the SSD o
   branch complete, and polls and retries it like any job.  Its context has `branch = "finalize"` and `data.finalize =
   true`; like a branch it is done exactly when all of its `outputs` exist.  A manifest with `finalize` switches
   `--supervisor-job` on (unless `--wait`), so the step runs `--supervisor-interval` after the last branch at the latest.
-  Resumes leave it to the original submission (`humsub tick ORIGINAL` runs it by hand); `submission-status` shows it.
+  `humsub tick SUBMISSION` runs a pass by hand; `submission-status` shows the step's state.
 
 ### Manifests from a folder search: `make-manifest`
 
@@ -315,17 +315,18 @@ humsub submit-manifest --manifest M --payload P|builtin:container [--stage N=PAT
         [--max-hops H] [--nice N] [--signal-seconds S] [--grace-seconds G] [--sbatch-arg ARG]… [--skip-path-checks]
         [--retry-payload N | --safety-margin F] [--max-concurrent N] [--scratch beegfs|ssd]
         [--supervisor-job [--supervisor-interval S] [--supervisor-rounds R]] [--ignore-quota-check]
-humsub resume SUBMISSION [--dry-run] [--include-active] [--stage N=PATH]… [same policy options]
+humsub resume SUBMISSION [--dry-run] [--retries R] [--parallel-jobs J] [--stage N=PATH]… [--supervisor-job]
+        [--time T] [--account A] [--partition P] [--max-hops H] [--nice N] [--sbatch-arg ARG]…   continue after a give-up
 humsub tick SUBMISSION                         one law pass: poll once, resubmit failed jobs, submit what is ready
 humsub submit [same Slurm options] [--dry-run] [--run-name NAME] -- ARGS…      single-command mode
-humsub submission-status SUBMISSION            chains of a submission, plus done/in-flight/missing branches of its lineage
+humsub submission-status SUBMISSION            chains of a submission, done/in-flight/failed branches, failed law jobs, finalize
 humsub status CHAIN                            one chain: state, jobs, queue, log paths
 humsub follow CHAIN [-n LINES]                 follow the active log across hops; exit code = chain result
 humsub cancel CHAIN                            scancel all jobs of the chain and mark it failed
 humsub cleanup SUBMISSION [--dry-run] [--force]
-humsub gc [--apply] [--successful-after-hours H] [--failed-after-hours H] [--orphans-after-hours H] [--stale-scratch]
+humsub gc [--apply | --submission ID… | -f] [--successful-after-hours H] [--failed-after-hours H] [--orphans-after-hours H] [--stale-scratch]
 humsub stats SUBMISSION [--json]               what the production cost: jobs, runtimes, core-hours, queue waits, failures, peak concurrency
-humsub prune (--run NAME | --id PREFIX | --before DATE)… [--lineage] [--apply] [--force]     delete the provenance of finished submissions
+humsub prune (--run NAME | --id PREFIX | --before DATE)… [--apply] [--force]     delete the provenance of finished submissions
 humsub doctor [--probe] [--check-path P]… [--manifest M] [--timeout S]    can this setup run a production? (--probe: from a batch node)
 humsub help                                    same as --help
 ```
@@ -364,12 +365,33 @@ minutes.  Now:
 
 `--signal-seconds` and `--grace-seconds` override both values per submission.
 
-### Concurrency, scratch and the SSD quota
+### Concurrency: `--max-concurrent` and `--parallel-jobs`
 
-* `--max-concurrent N` keeps at most N chains in flight **without a controller process**: chains are dealt round-robin
-  to N lanes and the first hop of a chain starts after the previous chain of its lane (`--dependency=afterany`).
-  Continuation or retry hops of a chain can briefly overlap with the next chain of the lane (the cap is "N plus chains
-  currently in a later hop").  With `--wait`, `--parallel-jobs J` is the controller-based alternative.
+Two limits, for two different things:
+
+| | `--max-concurrent N` (lanes) | `--parallel-jobs J` (law) |
+|---|---|---|
+| limits | chains **running** | chains **in the Slurm queue at all** (each running chain also has one pre-queued follower) |
+| mechanism | when a chain is created, its first hop gets `--dependency=afterany` on the most recent job of the chain N positions earlier (round-robin lanes) | law keeps jobs back as "unsubmitted" and submits more in a pass while fewer than J are active |
+| a free slot is refilled | at once, by Slurm | at the next pass (`--supervisor-interval`, or the `--wait` controller's poll interval) |
+| queue footprint | every chain is queued from the start | at most J chains |
+| retries / later chains | respect the lane if its predecessor is still alive | counted like any other active job |
+| changeable later | no (fixed when a chain is created) | yes: `humsub resume --parallel-jobs J` |
+
+* **Short branches** (minutes): prefer `--max-concurrent`; with `--parallel-jobs` and a 30-minute supervisor interval
+  most slots would stay empty between passes.
+* **Huge productions**: `--parallel-jobs` bounds what sits in the queue.  Hummel-2 has no per-user limit, but
+  `MaxJobCount` (100000) is shared by *all* users; pack inputs into branches (`make-manifest --files-per-branch`) first.
+* **Both together** means: at most J chains queued, at most N of them running, so it requires **J > N** (humsub refuses
+  J ≤ N: the lanes would never hold anything back).  The queued backlog `J - N` must bridge one pass, roughly
+  `J - N ≥ N × supervisor_interval / branch duration` (e.g. N = 200, 10-minute branches, 30-minute interval: J ≈ 800).
+* The lane cap is "N plus chains currently in a later hop": continuation or retry hops of a chain can briefly overlap
+  with the next chain of the lane.  A lane predecessor that has already ended gives no dependency (`afterany` on it is
+  satisfied anyway; Slurm 24.11 also treats a dependency on a job it purged after `MinJobAge` as satisfied, but this
+  does not rely on it); should `sbatch` ever reject the dependency, the chain is submitted without it.
+
+### Scratch and the SSD quota
+
 * Every running chain job holds an unpacked container runtime (≈ 150-250 MB) on the SSD, and with `--scratch ssd` its
   branch scratch as well.  Before submitting, `humsub` estimates `concurrent chains × (fast_bytes_per_job [+ scratch])`
   and refuses a submission that would use more than 80 % of the free SSD quota (read from `rrz-quota`), printing the
@@ -377,7 +399,7 @@ minutes.  Now:
 
 ### Retrying and resuming
 
-There are three layers; choose the one that fits, you do not need all of them.
+Inside a job (1, 2) and across jobs (3, 4); choose what fits, you do not need all of them.
 
 1. **`--retry-payload N`** — a failing payload (exit ≠ 0 or declared outputs missing) is re-run up to N times inside the
    same job, with a fresh scratch.  Retries are **time-aware**: before an attempt the longest previous attempt (× 1.2)
@@ -389,31 +411,89 @@ There are three layers; choose the one that fits, you do not need all of them.
    tasks-per-job))` extra hops on failures, on top of `max_hops`; a spare follower exits immediately when everything is
    done.  The Slurm job of the failed hop stays `FAILED` in `sacct`, so the history remains readable.  It is a
    per-chain budget: a permanently broken input exhausts only its own chain's budget.  Mutually exclusive with
-   `--retry-payload` and `--retries`.
-3. **`humsub resume SUBMISSION`** — compare the frozen manifest with the outputs on disk and submit a *new submission*
-   (run `<run>-resume<N>`, same output paths, same options unless overridden) for exactly the branches that are missing
-   and not owned by a live chain.  Run it whenever you look at the production; it also removes the scratch of Slurm
-   jobs that no longer exist.  `--dry-run` shows the plan, `--include-active` also takes branches of still-running
-   chains, `--stage proxy=…` replaces a stage source (stages are re-copied from their sources on every resume, so a renewed
-   proxy is picked up).  `humsub submission-status` ends with the lineage summary: branches done / in flight / missing.
-4. **`--supervisor-job` (law passes)** — the recommended way to run a production unattended.  A one-CPU job re-queues
+   `--retry-payload` (one in-chain mechanism); nests with law's `--retries` (below).
+3. **`--supervisor-job` (law passes)** — the recommended way to run a production unattended.  A one-CPU job re-queues
    itself every `--supervisor-interval` seconds (min 60, default 1800) and runs one **pass**: law re-runs the
    submission's top task with `no_poll`, which polls every chain once, **resubmits failed jobs** (up to `--retries R`,
    default `--supervisor-rounds` = 3; counted across passes from law's jobs file), submits jobs still waiting for
    `--parallel-jobs` room, and runs every task whose requirements are complete (e.g. the manifest's `finalize`
    workflow).  It stops when the top task is complete and gives up when law reports jobs that failed with no retries
-   left.  `humsub tick SUBMISSION` runs one pass by hand (a lock keeps two passes from overlapping).  The supervisor is
+   left.  `humsub tick SUBMISSION` runs one pass by hand (the control lock, below, keeps passes from overlapping).  The supervisor is
    never niced (a niced watchdog starves on a busy partition).  `scrontab` is disabled on Hummel-2, so this is the cron
    substitute inside the cluster; `humsub tick` from your own cron works as well.
-5. **`--wait --retries R`** (controller based): law keeps polling and resubmits failed branches while the
+4. **`--wait --retries R`** (controller based): law keeps polling and resubmits failed branches while the
    submitting process lives.
+
+#### One supervisor, one pass at a time: the control lock
+
+Every submission has a **control lock**, `<submission dir>/control.lock`.  Whoever runs a pass or changes the supervisor
+schedule must hold it: the supervisor job (from its start to its end, including queuing its successor), `humsub tick`,
+`humsub resume` and `submit-manifest` while it queues the first supervisor.  Supervisor jobs can only be queued under
+it, so a supervisor is only ever queued by the running supervisor itself or while none runs; a supervisor that finds
+another supervisor holding the lock ends at once **without** a successor, so two lines of supervisors can never form.
+A supervisor that finds a `tick`/`resume` holding it waits (up to 20 minutes); `tick` reports `busy`, `resume` refuses.
+
+* **Across nodes.**  On Hummel-2's BeeGFS `flock` is node-local (a compute node acquires a lock the login node holds),
+  so the lock is the *existence* of the file, created with `O_EXCL`, which BeeGFS makes atomic cluster-wide.  The file
+  records its owner (Slurm job id or host and pid, purpose, a unique token); `cat control.lock` shows who holds it.
+* **Crashes never block the production.**  The holder removes the file when it ends (also on Slurm's SIGTERM), but
+  nothing runs after SIGKILL, an OOM kill or a node failure, so a lock is also released by its **staleness**, decided
+  without the owner: a Slurm job that Slurm no longer lists (if Slurm cannot be asked, the lock counts as alive), a
+  process on the same host whose pid is gone, or any lock not refreshed for 10 minutes (the holder touches it every
+  minute).  A stale lock is broken by an atomic rename, so two processes cannot both break it and both own it.
+
+#### In-chain retries (`--safety-margin`) versus law retries (`--retries`)
+
+They nest: while a chain retries in its own follower hops, law sees it as running; only when its budget is used up
+does law see the job fail, and then starts a **new chain** (with a fresh hop budget) for it.  A job therefore gets at
+most `(1 + safety-margin hops) × (1 + retries)` attempts.  They differ in *when* and *how* the retry runs:
+
+| | `--safety-margin` (follower hop) | law `--retries` (pass) |
+|---|---|---|
+| starts | at once: the follower was queued when the failed hop started | at the next pass (up to `--supervisor-interval`), then queued anew |
+| queue priority | the follower's (it has been waiting since the hop started) | a fresh, niced job at the back of the queue |
+| budget | `max_hops + margin` of the same chain | law's `attempts`; the new chain has its full `max_hops` |
+| covers | the payload failing in a chain that still has a queued follower | anything that ends a chain: payload failure, budget exhausted, chain killed/cancelled, failed to start, lost follower |
+| `HUMSUB_HOP` / logs | continues the chain's hop count; one chain history | a new chain starting at hop 0; law's jobs file links the chains |
+
+Use the safety margin for **cheap, fast retries of transient failures** (a flaky node, a filesystem hiccup) in long
+productions, and law retries (the supervisor's default: `--supervisor-rounds`) as the **safety net** that also covers
+everything a chain cannot handle itself; `humsub resume` grants new law retries after a give-up.  E.g. a large
+production: `--safety-margin 0.5 --supervisor-job` (law retries default to 3).
+
+#### What survives a retry
+
+The same in every mechanism, because it is defined by the manifest, not by the chain:
+
+* **Branches whose outputs exist are never re-run** (law skips them within a job of several branches, `--tasks-per-job`).
+* **The failed branch starts from the beginning**: its declared outputs are deleted before every attempt, and its
+  scratch (`HUMSUB_SCRATCH`, `HUMSUB_SCRATCH_FAST`) is removed when it fails (a few small text files are kept in
+  `<run_dir>/leftovers/` for diagnosis).
+* **`extra_outputs` survive**, at the same fixed paths: they are the place for **checkpoints**.  A payload that
+  checkpoints there resumes from the checkpoint after any kind of retry (in-job, follower hop, law, `resume`) and after
+  a time-limit continuation; one that keeps its state in the scratch or derives it from `HUMSUB_HOP` does not.
+* Single-command mode (`humsub submit`) differs: its `{CKPT}` is only filled in on hops > 0 of the same chain, so a
+  retry in a *new* chain would start from scratch.  Single-command submissions have neither safety margins nor passes
+  today; keep this in mind before adding them.
 
 The dependency logic is law's own: the submission records its top task (`law_task` in `submission.json`), and a pass
 is nothing but `luigi.build` of that task with every `HummelWorkflow` in `no_poll` mode, so any law task graph built on
-`HummelWorkflow` can be driven this way.
+`HummelWorkflow` can be driven this way.  law's jobs files (`<law_dir>/control/slurm_jobs_*.json`) are the record of
+which chain each job currently runs on and how many retries it used; `humsub submission-status` reads them (done / in
+flight / not yet submitted / failed branches, and every failed job with its retries).
+
+**After a give-up: `humsub resume SUBMISSION`.**  When the passes gave up (law reports jobs with no retries left), fix
+the cause and resume.  Everything stays in the same submission and the same law workflow: resume grants every failed job
+(branch or finalize workflow) a fresh budget of `--retries` (default: as submitted, at least 1), applies changed settings
+to the chains created from now on (`--time`, `--account`, `--partition`, `--max-hops`, `--nice`, `--sbatch-arg`, ...,
+`--parallel-jobs`), re-copies the stages named with `--stage NAME=PATH` (e.g. a renewed proxy; a stage removed by `humsub
+cleanup` is restored from its recorded source, all other stages stay frozen), removes the scratch of Slurm jobs that no
+longer exist, runs one pass right away (which resubmits the failed jobs) and queues the supervisor again if the
+submission is supervised (`--supervisor-job` adds one).  `--dry-run` shows what would change.  Branches whose outputs
+exist are never redone.
 
 Resubmitting the same manifest with a fresh `--run-name` still skips branches whose outputs exist *if the manifest's
-output paths do not contain the run name*; `resume` does not depend on that.
+output paths do not contain the run name*.
 
 ### Doctor: check the setup before a production
 
@@ -431,14 +511,14 @@ Exit status 1 if anything failed.  A probe that does not start within the timeou
 
 ### Stats: what did it cost?
 
-`humsub stats SUBMISSION` (any submission or run name of the lineage) sums up the whole lineage — the original submission, its resumes and supervisor jobs — from the
+`humsub stats SUBMISSION` (submission id or run name) sums up the submission — every chain law started for it, retries included, and the supervisor jobs — from the
 chain state and `sacct`: job counts by state, runtimes of the completed jobs (min/median/max/total), core-hours of everything that ran, the share spent in failed or
 cancelled jobs, queue waits, wall-clock, how many chains needed more than one job (continuations or retry hops) and the peak number of jobs running at once.  `--json` for scripts.
 
 ### Cleaning up provenance: prune
 
 `gc` removes SSD caches; the submission records, chain state, run directories and Slurm logs are provenance and stay.  When a production has been verified and its results moved,
-`humsub prune` deletes that provenance for *selected submissions only* (`--run NAME`, `--id PREFIX`, `--before YYYY-MM-DD`; `--lineage` adds every resume derived from a selected one).
+`humsub prune` deletes that provenance for *selected submissions only* (`--run NAME`, `--id PREFIX`, `--before YYYY-MM-DD`).
 It deletes what the selected submissions **own** — their submission and chain directories, their run directory, the Slurm logs of exactly their job ids (supervisor jobs included) and their
 staging and scratch caches — and nothing else: older runs, other projects' logs in the same `output_dir` and, always, every output declared in a manifest are untouched (a directory that
 contains a declared output is kept with a note).  It is a dry run unless `--apply`; submissions that still look active are refused unless `--force`.
@@ -454,13 +534,42 @@ contains a declared output is kept with a note).  It is a dry run unless `--appl
 | failure diagnostics | `<run_dir>/leftovers/<jobid>-<branch>/` | by hand (a few small text files) |
 
 `cleanup SUBMISSION` removes the cache trees (stages, fast and bulk scratch) of one finished submission (active ones are refused without
-`--force`).  `gc` considers all submissions of the current project: it only reports unless `--apply`; defaults:
-successful after 24 h, failed after 168 h.  `--orphans-after-hours H` additionally removes cache directories
-no submission of this `output_dir` refers to — submissions made by this version carry an owner marker, so
-other projects' live staging in a shared `cache_dir` is spared, but **staging from older versions is
-indistinguishable from an orphan**: use a large `H`.  `gc --stale-scratch` additionally removes scratch directories
-whose Slurm job is no longer in the queue (killed by SIGKILL, node failure, `scancel`).  CVMFS/`cmsexec` caches and
-runtimes are not touched by `humsub` at all.
+`--force`).
+
+`gc` collects what can go, **per submission**: the caches of finished submissions after the retention time (defaults: successful
+after 24 h, failed after 168 h), with `--stale-scratch` the scratch of Slurm jobs that no longer exist (killed by SIGKILL, node
+failure, `scancel`), and with `--orphans-after-hours H` cache directories no submission of this `output_dir` refers to
+(submissions made by humsub ≥ 0.4 carry an owner marker, so other projects' live staging in a shared `cache_dir` is spared, but
+**staging from older versions is indistinguishable from an orphan**: use a large `H`).  It lists every submission with what would
+be removed, and then:
+
+| | |
+|---|---|
+| `humsub gc` | lists only (dry run) |
+| `humsub gc --apply` | asks which to clean (`1,3`, `2-4`, `all`, or Enter for none); without a terminal it deletes nothing |
+| `humsub gc --submission ID` | cleans exactly the named submissions (id, id prefix or run name; repeatable), without asking |
+| `humsub gc -f` | **cleans everything listed, without asking**: caches and scratch cannot be recovered, and failed submissions lose what you may still need to debug or resume them |
+
+CVMFS/`cmsexec` caches and runtimes are not touched by `humsub` at all.
+
+### Several projects and users side by side
+
+* **Everything is keyed by submission.**  Submission ids (timestamp + random part) are unique, and so are the submission
+  directory, its control lock, its supervisor, its chains, stages and scratch.  Projects that share `output_dir` and `cache_dir`
+  (the defaults are the same for all projects of a user) never see each other's locks or supervisors; a supervisor only ever
+  acts on the submission named in its arguments (its log starts with `submission <id> (run …, project …)`).
+* **Liveness is decided cluster-wide, deletion per user.**  Scratch counts as stale only if its Slurm job id is not in
+  `squeue` for *any* user, and only directories owned by the current user are ever removed, so a shared `bulk_scratch_dir` or
+  `cache_dir` is safe.  If `squeue` cannot be asked, nothing is removed (an empty answer would mean "every job is dead").
+* **A submission belongs to the user who made it** (`user`/`uid` in `submission.json`).  `tick`, `resume`, `cancel`,
+  `cleanup`, `prune` and `gc` refuse other users' submissions, so a supervisor never runs under the wrong account; read-only
+  commands (`status`, `submission-status`, `stats`, `follow`) work for everyone with read access, e.g. on a group folder.
+* **Locking protocol versions.**  A submission records the control-lock generation of its supervisors.  `tick` and `resume`
+  refuse a submission whose supervisor from an older humsub (without the cross-node control lock) is still running; once it
+  has ended, they upgrade the submission, and its next supervisor is built from the current version.
+* **Never use name-based Slurm features on humsub jobs** (`--dependency=singleton`, `scancel --name`, ...): job names
+  (`<job_name>`, `<job_name>-supervisor`) are shared by all submissions with the same `job_name`.  humsub itself only ever
+  addresses jobs by id.
 
 ## Troubleshooting
 
@@ -516,16 +625,34 @@ A real end-to-end test needs Slurm: run `examples/hello/run.sh` on a frontend.
 ## Tests
 
 ```bash
-python -m pytest tests --ignore=tests/e2e     # unit tests, no cluster needed
-tests/e2e/run.sh                              # end-to-end against a real Slurm configured like Hummel-2
-tests/e2e/run.sh -m slow                      # also the slow ones (real time limits, ~1 min)
+python -m pytest tests --ignore=tests/e2e     # unit tests, no cluster needed (~15 s)
+tests/e2e/run.sh                              # end-to-end against a real Slurm configured like Hummel-2 (fast profile)
+E2E_PROFILE=realistic tests/e2e/run.sh        # the same with Hummel's timing (real time limits, 60 s passes)
+tests/e2e/run.sh -k finalize -x               # any pytest arguments
 ```
 
 The end-to-end tests run inside the Docker image from
 [hummel-slurm-ci](https://github.com/uhh-pd-ml/hummel-slurm-ci) (Slurm 24.11 with Hummel's partitions,
-accounts, submit filter and `/sw/batch/init.sh`); they submit real manifests, chains, failures,
-cancellations and a pre-timeout continuation.  Set `WHEELHOUSE=dir` to install from local wheels when the
-container has no network.  Without `WHEELHOUSE`, `run.sh` builds a wheelhouse on the *host* once
-(`~/.cache/humsub-e2e-wheelhouse`, needs `pip` and network) because the container usually has no working DNS; `NO_WHEELHOUSE=1`
-installs from the network inside the container instead.  `IMAGE=` selects the image; by default a locally available `hummel-slurm-ci:latest`
-is used, else the one on ghcr.io.  A full run (unit + e2e incl. slow tests) takes about 15 minutes.
+accounts, submit filter and `/sw/batch/init.sh`); they submit real manifests, chains, failures, retries,
+supervisor passes, finalize steps, cancellations and pre-timeout continuations.
+
+Almost all of their time is waiting for Slurm, so they are built to wait as little as possible:
+
+* **in parallel** (`pytest-xdist`, `E2E_WORKERS`, default 6): every test cancels only its own jobs (never
+  `scancel -u`), uses its own output, cache and scratch directories, and checks only its own queue entries;
+* **two profiles** (`E2E_PROFILE`).  `fast` (default; every push and PR in CI): the image's fast scheduler loop, supervisor
+  passes every 5 s (`HUMSUB_MIN_SUPERVISOR_INTERVAL` lowers humsub's 60 s floor for the tests only), and tests marked
+  `deadline` send the pre-timeout signal themselves (`project.reach_deadline()`: `scancel --batch --signal=USR1`, what
+  slurmctld sends) instead of waiting for real time limits.  `realistic` (weekly, on `main` and by hand in CI): Hummel's
+  scheduler timing, real time limits and 60 s passes; `deadline` and `supervisor` tests are then marked `slow`;
+* **no fixed sleeps**: wait for a condition (`project.wait_for_log()`, files) with a generous timeout;
+* `--durations=0` and `[run.sh] Ns: ...` lines show where the time goes.
+
+A new test that needs a hop to run out of time uses `project.configure_deadline(...)` and `project.reach_deadline(chain,
+hop, after=...)`, where `after` is a line *the payload* prints (the worker installs its signal handler only right before
+it starts the payload).
+
+Set `WHEELHOUSE=dir` to install from local wheels when the container has no network.  Without `WHEELHOUSE`, `run.sh`
+builds a wheelhouse on the *host* once (`~/.cache/humsub-e2e-wheelhouse`, needs `pip` and network) because the container
+usually has no working DNS; `NO_WHEELHOUSE=1` installs from the network inside the container instead.  `IMAGE=` selects
+the image; by default a locally available `hummel-slurm-ci:latest` is used, else the one on ghcr.io.

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-import fcntl
 import importlib
 import os
 from pathlib import Path
@@ -21,7 +20,6 @@ from typing import Any, Iterator
 
 from .submission import load_submission_spec
 
-LOCK_NAME = ".tick.lock"
 #: Set during a pass: every HummelWorkflow instantiated then runs with ``no_poll`` (see HummelWorkflow.__init__).
 TICK_ENV = "HUMSUB_TICK"
 
@@ -42,7 +40,7 @@ def manifest_law_task(
         "params": {
             "humsub_spec": str(spec_path),
             "workflow": "slurm",
-            "retries": int(opts.get("retries", 0)),
+            "retries": int(opts.get("retries") or 0),
             "tasks_per_job": int(opts.get("tasks_per_job", 1)),
             "parallel_jobs": int(opts.get("parallel_jobs", 0)),
             "job_workers": 1,
@@ -53,6 +51,27 @@ def manifest_law_task(
 def law_task_of(spec_path: Path, spec: dict[str, Any]) -> dict[str, Any]:
     # submissions made before passes existed are manifest workflows
     return spec.get("law_task") or manifest_law_task(spec_path, spec.get("submit_options", {}))
+
+
+def ensure_lock_generation(spec_path: Path) -> None:
+    """Refuse to drive a submission whose (older) supervisor may still run without the cross-node control lock; once
+    none runs, upgrade it: its next supervisor is built from this version (fresh snapshot) and takes the lock."""
+    from .config import ConfigError
+    from .slurm import live_job_ids
+    from .submission import CONTROL_LOCK_GENERATION, update_submission_spec
+
+    spec = load_submission_spec(spec_path)
+    if int(spec.get("control_lock", 0)) >= CONTROL_LOCK_GENERATION:
+        return
+    alive = live_job_ids() & {str(j) for j in spec.get("supervisor_job_ids", [])}
+    if alive:
+        raise ConfigError(
+            f"supervisor job(s) {', '.join(sorted(alive))} of this submission run an older humsub without the "
+            "cross-node control lock; wait for them to end (or scancel them), then try again"
+        )
+    for name in ("hummel-submit-worker.zip", "supervisor.sh"):
+        (spec_path.parent / "supervisor" / name).unlink(missing_ok=True)
+    update_submission_spec(spec_path, lambda data: data.update(control_lock=CONTROL_LOCK_GENERATION))
 
 
 def instantiate(desc: dict[str, Any]):
@@ -83,20 +102,6 @@ def _is_waiting(exc: BaseException) -> bool:
 
 
 @contextmanager
-def _pass_lock(spec_path: Path) -> Iterator[bool]:
-    with (spec_path.parent / LOCK_NAME).open("a+") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-@contextmanager
 def _tick_env() -> Iterator[None]:
     previous = os.environ.get(TICK_ENV)
     os.environ[TICK_ENV] = "1"
@@ -109,16 +114,20 @@ def _tick_env() -> Iterator[None]:
             os.environ[TICK_ENV] = previous
 
 
-def run_tick(spec_path: Path) -> TickResult:
-    """One pass over the submission's law task graph (never two at once for the same submission)."""
+def run_tick(spec_path: Path, purpose: str = "law pass") -> TickResult:
+    """One pass over the submission's law task graph, under the submission's control lock (re-entrant: a caller that
+    already holds it, like the supervisor or resume, keeps it)."""
     import luigi
     from luigi.task_register import Register
 
+    from .locks import ControlLock, describe
+
     spec_path = spec_path.resolve()
     spec = load_submission_spec(spec_path)
-    with _pass_lock(spec_path) as locked:
-        if not locked:
-            return TickResult("busy", ["another pass over this submission is running"])
+    lock = ControlLock(spec_path.parent, purpose)
+    if not lock.try_acquire():
+        return TickResult("busy", [f"the submission is busy: {describe(lock.holder() or {})}"])
+    try:
         with _tick_env():
             # fresh task instances (and with them fresh law proxies): everything is re-read from disk
             Register.clear_instance_cache()
@@ -127,6 +136,8 @@ def run_tick(spec_path: Path) -> TickResult:
             task = instantiate(law_task_of(spec_path, spec))
             luigi.build([task], local_scheduler=True, workers=1)
             complete = task.complete()
+    finally:
+        lock.release()
     errors = [f"{task_id}: {exc}" for task_id, exc in _failures if not _is_waiting(exc)]
     if complete:
         return TickResult("complete")

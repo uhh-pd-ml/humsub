@@ -220,14 +220,20 @@ def query_jobs(job_ids: list[str]) -> dict[str, SlurmJobStatus]:
     return result
 
 
-def live_job_ids(user: str | None = None) -> set[str]:
-    """Slurm job ids of *user* (default: the current user) that are pending or running."""
+def live_job_ids(user: str | None = None, *, all_users: bool = False) -> set[str]:
+    """Slurm job ids that are pending or running: of *user* (default: the current user), or of everybody.
+
+    Raises SlurmError when Slurm cannot be asked: an empty answer would mean "every job is dead", and callers delete
+    things on that basis (stale scratch).  Use ``all_users`` whenever the answer decides about directories that other
+    users' or other projects' jobs could own: job ids are unique cluster-wide."""
     import getpass
-    proc = subprocess.run(
-        [slurm_command("squeue"), "-h", "-u", user or getpass.getuser(), "-o", "%i"],
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
+    cmd = [slurm_command("squeue"), "-h", "-o", "%i"]
+    if not all_users:
+        cmd += ["-u", user or getpass.getuser()]
+    try:
+        proc = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SlurmError(f"cannot list live Slurm jobs: {exc}") from exc
+    if proc.returncode != 0:
+        raise SlurmError(f"cannot list live Slurm jobs: {(proc.stderr or '').strip() or f'squeue exit {proc.returncode}'}")
     return {line.strip().split("_")[0] for line in proc.stdout.splitlines() if line.strip()}

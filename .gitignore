@@ -8,3 +8,6 @@ dist/
 *.patch
 .coverage
 .coverage-e2e/
+# placeholders left by sshfs (.fuse_hidden*) and NFS (.nfs*) for files deleted while still open
+.fuse_hidden*
+.nfs*

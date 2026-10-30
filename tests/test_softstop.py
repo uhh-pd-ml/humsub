@@ -140,7 +140,7 @@ def test_bad_extra_outputs_are_rejected(tmp_path: Path, bad) -> None:
         load_manifest(_manifest(tmp_path, {"extra_outputs": bad}))
 
 
-def test_extra_outputs_reach_the_branch_context_and_survive_a_resume_subset(tmp_path: Path) -> None:
+def test_extra_outputs_reach_the_branch_context(tmp_path: Path) -> None:
     spec_path = tmp_path / "sub" / "submission.json"
     atomic_write_json(spec_path, {"submission_id": "s", "run_name": "r", "run_dir": str(tmp_path / "run")})
     payload = tmp_path / "p.sh"

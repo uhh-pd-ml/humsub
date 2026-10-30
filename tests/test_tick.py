@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -65,11 +64,12 @@ def test_pass_outcomes(tmp_path: Path, cls, state) -> None:
     assert tick.TICK_ENV not in os.environ
 
 
-def test_a_second_pass_backs_off_while_one_holds_the_lock(tmp_path: Path) -> None:
+def test_a_pass_backs_off_while_someone_else_holds_the_control_lock(tmp_path: Path) -> None:
     spec_path = _spec(tmp_path)
-    with (spec_path.parent / tick.LOCK_NAME).open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        assert tick.run_tick(spec_path).state == "busy"
+    (spec_path.parent / "control.lock").write_text(json.dumps(
+        {"host": "elsewhere", "pid": 1, "purpose": "supervisor", "since": 0, "token": "other"}))
+    result = tick.run_tick(spec_path)
+    assert result.state == "busy" and "supervisor" in result.errors[0]
 
 
 def test_old_submissions_get_the_manifest_task(tmp_path: Path) -> None:
@@ -92,5 +92,6 @@ def test_law_retries_defaults_with_the_supervisor() -> None:
     assert SubmitOptions().law_retries() == 0
     assert SubmitOptions(supervisor_job=True).law_retries() == 3           # --supervisor-rounds
     assert SubmitOptions(supervisor_job=True, retries=1).law_retries() == 1
-    assert SubmitOptions(supervisor_job=True, safety_margin=0.5).law_retries() == 0
+    assert SubmitOptions(supervisor_job=True, safety_margin=0.5).law_retries() == 3   # nested, not exclusive
+    assert SubmitOptions(supervisor_job=True, retries=0).law_retries() == 0       # an explicit 0 is respected
     SubmitOptions(supervisor_job=True, retries=2).validate()                 # no --wait needed any more

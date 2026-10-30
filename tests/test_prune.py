@@ -89,17 +89,10 @@ def test_apply_removes_exactly_what_the_submission_owns(env: Env) -> None:
     assert [p.name for p in sorted((out / "logs").iterdir())] == ["job-supervisor_90.log"][0:0] + sorted(
         ["job_1.log", "job_13.log", "job_2.log", "job_99999.log"])
     assert not (env.cache / "stages" / "20261008-120000-bbbbbbbb").exists(), "staged proxy copy is removed"
-    # the older run, the resume (not selected without --lineage) and the foreign log are untouched
+    # the older run, the other submission and the foreign log are untouched
     assert (out / ".hummel-submit" / "submissions" / "20260921-100000-aaaaaaaa").exists()
     assert (out / ".hummel-submit" / "submissions" / "20261009-120000-cccccccc").exists()
     assert (out / ".hummel-submit" / "chains" / "cOld").exists() and (out / "runs" / "old-run").exists()
-
-
-def test_lineage_flag_includes_resumes(env: Env) -> None:
-    assert env.run("--run", "prod", "--lineage", "--apply") == 0
-    assert not (env.out / ".hummel-submit" / "submissions" / "20261009-120000-cccccccc").exists()
-    assert not (env.out / "logs" / "job_13.log").exists()
-    assert (env.out / ".hummel-submit" / "submissions" / "20260921-100000-aaaaaaaa").exists()
 
 
 def test_before_date_selects_by_creation(env: Env) -> None:

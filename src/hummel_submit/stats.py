@@ -1,7 +1,7 @@
 """``humsub stats``: what did a production cost?  Job counts, runtimes, core-hours, queue waits, failures, retries, peak concurrency.
 
-Built from the chain state of a submission's *lineage* (the original submission and its resumes) and ``sacct``.  Everything the
-final report of a production needs, without writing a script for it.
+Built from the chain states of a submission (every chain law ever started for it, retries included, plus the
+supervisor jobs) and ``sacct``.  Everything the final report of a production needs, without writing a script for it.
 """
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ import statistics
 import subprocess
 from typing import Any
 
-from .lineage import lineage_id, lineage_specs
 from .slurm import slurm_command
 from .state import chain_root, load_state
 
@@ -58,23 +57,19 @@ def query_sacct(job_ids: list[str]) -> list[dict[str, Any]]:
     return rows
 
 
-def lineage_job_ids(output_dir: Path, spec: dict[str, Any]) -> tuple[list[str], dict[str, int], int]:
-    """(all Slurm job ids of the lineage incl. supervisor jobs, jobs per chain, number of chains)."""
-    jobs: list[str] = []
+def submission_job_ids(output_dir: Path, spec: dict[str, Any]) -> tuple[list[str], dict[str, int], int]:
+    """(all Slurm job ids of the submission incl. supervisor jobs, jobs per chain, number of chains)."""
+    jobs = [str(j) for j in spec.get("supervisor_job_ids", [])]
     per_chain: dict[str, int] = {}
-    chains = 0
-    for _, sub in lineage_specs(output_dir, lineage_id(spec)):
-        jobs += [str(j) for j in sub.get("supervisor_job_ids", [])]
-        for chain_id in sub.get("chain_ids", []):
-            try:
-                state = load_state(chain_root(output_dir) / chain_id / "state.json")
-            except OSError:
-                continue
-            ids = [str(j) for j in state.get("jobs", [])]
-            jobs += ids
-            per_chain[chain_id] = len(ids)
-            chains += 1
-    return sorted(set(jobs), key=lambda j: (len(j), j)), per_chain, chains
+    for chain_id in spec.get("chain_ids", []):
+        try:
+            state = load_state(chain_root(output_dir) / chain_id / "state.json")
+        except OSError:
+            continue
+        ids = [str(j) for j in state.get("jobs", [])]
+        jobs += ids
+        per_chain[chain_id] = len(ids)
+    return sorted(set(jobs), key=lambda j: (len(j), j)), per_chain, len(per_chain)
 
 
 def _hours(seconds: float) -> float:
@@ -145,7 +140,7 @@ def format_stats(s: dict[str, Any]) -> list[str]:
 
 
 def stats_for(output_dir: Path, spec: dict[str, Any], job_name: str) -> dict[str, Any]:
-    ids, per_chain, _ = lineage_job_ids(output_dir, spec)
+    ids, per_chain, _ = submission_job_ids(output_dir, spec)
     rows = query_sacct(ids) if ids else []
     return summarize(rows, per_chain, supervisor_name=f"{job_name}-supervisor")
 
