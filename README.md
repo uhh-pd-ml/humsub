@@ -27,7 +27,8 @@ knows about any particular science application.
 | **job** | an actual Slurm job (Slurm job id).  A chain consists of one or more jobs |
 | **hop** | one Slurm allocation in a chain (hop 0 = first job) |
 | **continuation** | the *expected* extension of the same logical execution: a hop is stopped by the pre-timeout signal and the next hop re-runs the same law job |
-| **retry** | a *new attempt after a failure* (law-level, `--wait --retries N`); a failed chain does not continue |
+| **retry** | a *new attempt after a failure* (law-level, `--retries N`, done by the supervisor's passes or `--wait`); a failed chain does not continue |
+| **pass** | one run of law over a submission's task graph with `no_poll`: poll once, resubmit failed jobs, submit what is ready (`humsub tick`, the supervisor job) |
 | **stage** | named input file/directory frozen (copied) at submission, so later edits do not affect running jobs |
 
 `--tasks-per-job K` runs K branches one after another inside one chain (default 1: one chain per branch).
@@ -112,8 +113,12 @@ humsub cleanup SUBMISSION_ID             # delete the staged inputs on the SSD o
   "finalize": {"data": {"command": ["python", "merge.py"]}, "outputs": ["/beegfs/.../summary.json"]}
   ```
 
-  The schema is accepted (and `make-manifest` writes it), but **this version cannot run it yet**: `submit-manifest` refuses
-  a manifest with a `finalize` section.
+  It is a law workflow of its own (`ManifestFinalizeWorkflow`: one branch, the same payload, stages, `common` and Slurm
+  settings) whose requirement is the branch workflow, so law submits it in the first **pass** (below) that finds every
+  branch complete, and polls and retries it like any job.  Its context has `branch = "finalize"` and `data.finalize =
+  true`; like a branch it is done exactly when all of its `outputs` exist.  A manifest with `finalize` switches
+  `--supervisor-job` on (unless `--wait`), so the step runs `--supervisor-interval` after the last branch at the latest.
+  Resumes leave it to the original submission (`humsub tick ORIGINAL` runs it by hand); `submission-status` shows it.
 
 ### Manifests from a folder search: `make-manifest`
 
@@ -311,6 +316,7 @@ humsub submit-manifest --manifest M --payload P|builtin:container [--stage N=PAT
         [--retry-payload N | --safety-margin F] [--max-concurrent N] [--scratch beegfs|ssd]
         [--supervisor-job [--supervisor-interval S] [--supervisor-rounds R]] [--ignore-quota-check]
 humsub resume SUBMISSION [--dry-run] [--include-active] [--stage N=PATH]… [same policy options]
+humsub tick SUBMISSION                         one law pass: poll once, resubmit failed jobs, submit what is ready
 humsub submit [same Slurm options] [--dry-run] [--run-name NAME] -- ARGS…      single-command mode
 humsub submission-status SUBMISSION            chains of a submission, plus done/in-flight/missing branches of its lineage
 humsub status CHAIN                            one chain: state, jobs, queue, log paths
@@ -332,8 +338,8 @@ humsub help                                    same as --help
 
 * Default: `submit-manifest` returns once all chains are queued ("fire and forget"); law is not kept alive.
 * `--wait` keeps the submitting law process alive to poll the chains and to retry failed branches
-  (`--retries R`, only with `--wait`) and to apply `--parallel-jobs J` (at most J chains active at once;
-  default `0` = submit everything immediately, which is also the only sensible value without `--wait`).
+  (`--retries R`) and to apply `--parallel-jobs J` (at most J chains active at once; default `0` = submit everything
+  immediately).  `--supervisor-job` does the same without a login-node process, one law pass per interval.
   Use it in `tmux`/`screen`; if it dies, running chains are unaffected.
 * `--no-resubmit`: no continuation — a single Slurm job per chain, no stop signal.
 * `--dry-run`: validate the manifest, stages and paths and print the plan; submit nothing.
@@ -390,12 +396,21 @@ There are three layers; choose the one that fits, you do not need all of them.
    jobs that no longer exist.  `--dry-run` shows the plan, `--include-active` also takes branches of still-running
    chains, `--stage proxy=…` replaces a stage source (stages are re-copied from their sources on every resume, so a renewed
    proxy is picked up).  `humsub submission-status` ends with the lineage summary: branches done / in flight / missing.
-   `--supervisor-job` automates this: a one-CPU job re-queues itself every `--supervisor-interval` seconds (min 60, default
-   1800); while chains are alive it only waits, when none is alive and branches are missing it runs `resume`, at most
-   `--supervisor-rounds` times (default 3), then stops.  The supervisor is never niced (a niced watchdog starves on a busy partition).  `scrontab` is disabled on Hummel-2, so this is the cron substitute
-   inside the cluster; `humsub resume` from your own cron works as well.
-4. **`--wait --retries R`** (controller based, legacy): law keeps polling and resubmits failed branches while the
-   submitting process lives.  A failed chain is otherwise **not** continued.
+4. **`--supervisor-job` (law passes)** — the recommended way to run a production unattended.  A one-CPU job re-queues
+   itself every `--supervisor-interval` seconds (min 60, default 1800) and runs one **pass**: law re-runs the
+   submission's top task with `no_poll`, which polls every chain once, **resubmits failed jobs** (up to `--retries R`,
+   default `--supervisor-rounds` = 3; counted across passes from law's jobs file), submits jobs still waiting for
+   `--parallel-jobs` room, and runs every task whose requirements are complete (e.g. the manifest's `finalize`
+   workflow).  It stops when the top task is complete and gives up when law reports jobs that failed with no retries
+   left.  `humsub tick SUBMISSION` runs one pass by hand (a lock keeps two passes from overlapping).  The supervisor is
+   never niced (a niced watchdog starves on a busy partition).  `scrontab` is disabled on Hummel-2, so this is the cron
+   substitute inside the cluster; `humsub tick` from your own cron works as well.
+5. **`--wait --retries R`** (controller based): law keeps polling and resubmits failed branches while the
+   submitting process lives.
+
+The dependency logic is law's own: the submission records its top task (`law_task` in `submission.json`), and a pass
+is nothing but `luigi.build` of that task with every `HummelWorkflow` in `no_poll` mode, so any law task graph built on
+`HummelWorkflow` can be driven this way.
 
 Resubmitting the same manifest with a fresh `--run-name` still skips branches whose outputs exist *if the manifest's
 output paths do not contain the run name*; `resume` does not depend on that.

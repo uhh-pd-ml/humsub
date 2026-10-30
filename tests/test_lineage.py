@@ -142,18 +142,17 @@ def test_sweep_removes_only_dead_jobs(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "missing,active,round_no,checks,expected",
+    "tick_state,checks,expected",
     [
-        (0, 0, 1, 1, "done"),
-        (3, 5, 1, 1, "wait"),
-        (3, 0, 1, 1, "resume"),
-        (3, 0, 3, 7, "resume"),
-        (3, 0, 4, 9, "give-up"),   # more resume rounds than allowed: a bad input cannot loop forever
-        (0, 5, 1, 1, "wait"),
+        ("complete", 1, "done"),
+        ("progress", 1, "wait"),
+        ("busy", 5, "wait"),        # another pass (e.g. a manual `humsub tick`) holds the lock
+        ("failed", 1, "give-up"),   # law reports jobs failed with no retries left
+        ("progress", 2000, "give-up"),
     ],
 )
-def test_supervisor_decisions(missing, active, round_no, checks, expected) -> None:
-    assert decide(missing=missing, active_branches=active, round_no=round_no, max_rounds=3, checks=checks) == expected
+def test_supervisor_decisions(tick_state, checks, expected) -> None:
+    assert decide(tick_state=tick_state, checks=checks) == expected
 
 
 def test_supervisor_can_use_its_own_account_and_partition(tmp_path: Path) -> None:

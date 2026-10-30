@@ -1,9 +1,8 @@
-"""Supervisor job: a tiny Slurm job that periodically resumes missing branches without a login-node process.
+"""Supervisor job: a tiny Slurm job that drives a submission's law task graph without a login-node process.
 
-It checks the lineage of a submission every ``supervisor_interval`` seconds.  While chains are alive it
-only re-queues itself; when nothing is alive and branches are still missing it runs ``resume`` (at most
-``supervisor_max_rounds`` times, so one broken input cannot consume jobs forever) and queues itself once
-more to verify the outcome.  It stops when every output exists.
+Every ``supervisor_interval`` seconds it runs one *pass* (:mod:`hummel_submit.tick`): law polls the workflow once,
+resubmits failed jobs within ``retries`` and submits what is pending.  It stops when the top law task is complete,
+and gives up when law reports jobs that failed with no retries left.
 """
 from __future__ import annotations
 
@@ -11,7 +10,8 @@ from pathlib import Path
 import subprocess
 import sys
 
-from .lineage import compute_overview, format_overview, resume
+from .lineage import compute_overview, finalize_state, format_overview
+from .tick import run_tick
 from .slurm import SlurmError, slurm_command
 from .state import write_worker_snapshot
 from .submission import append_spec_list, load_submission_spec
@@ -73,15 +73,13 @@ def submit_supervisor(spec_path: Path, round_no: int, checks: int = 1) -> str:
     return job_id
 
 
-def decide(*, missing: int, active_branches: int, round_no: int, max_rounds: int, checks: int) -> str:
-    """'done' | 'wait' | 'resume' | 'give-up'."""
-    if missing == 0 and active_branches == 0:
+def decide(*, tick_state: str, checks: int) -> str:
+    """'done' | 'wait' | 'give-up' after one pass."""
+    if tick_state == "complete":
         return "done"
-    if active_branches > 0:
-        return "wait" if checks < MAX_CHECKS else "give-up"
-    if round_no > max_rounds:
+    if tick_state == "failed":
         return "give-up"
-    return "resume"
+    return "wait" if checks < MAX_CHECKS else "give-up"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -91,25 +89,28 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     spec_path = Path(argv[0])
     parts = argv[1].split(":")
-    round_no = int(parts[0])
+    round_no = int(parts[0])  # kept in the job arguments for older frozen supervisor scripts; law counts retries now
     checks = int(parts[1]) if len(parts) > 1 else 1
     spec = load_submission_spec(spec_path)
     output_dir = Path(spec["output_dir"])
-    max_rounds = int(spec.get("submit_options", {}).get("supervisor_max_rounds", 3))
 
-    ov = compute_overview(output_dir, spec)
-    for line in format_overview(ov):
+    result = run_tick(spec_path)
+    spec = load_submission_spec(spec_path)
+    for line in format_overview(compute_overview(output_dir, spec), hint=False):
         log(line)
-    action = decide(missing=len(ov.missing), active_branches=ov.active, round_no=round_no, max_rounds=max_rounds, checks=checks)
-    log(f"round {round_no}/{max_rounds}, check {checks}: {action}")
+    finalize = finalize_state(spec)
+    if finalize:
+        log(f"finalize:   {finalize}")
+    action = decide(tick_state=result.state, checks=checks)
+    log(f"check {checks}: pass {result.state} -> {action}")
     if action == "done":
         return 0
     if action == "give-up":
-        log(f"giving up: {len(ov.missing)} branch(es) still missing after {max_rounds} resume round(s); inspect with `humsub submission-status`")
+        for error in result.errors[:20]:
+            log(f"  {error}")
+        log("giving up: law has no retries left (or too many checks); inspect with `humsub submission-status`, "
+            "fix the cause and run `humsub tick` or `humsub resume`")
         return 1
-    if action == "resume":
-        resume(output_dir, spec_path, from_supervisor=True)
-        round_no += 1
     job = submit_supervisor(spec_path, round_no, checks + 1)
     log(f"queued next check as job {job}")
     return 0

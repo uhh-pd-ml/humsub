@@ -17,6 +17,7 @@ from .staging import stage_inputs
 from .state import atomic_write_json, chain_root
 from .submission import create_submission_spec, load_submission_spec
 from .cleanup import OWNER_MARKER
+from .tick import manifest_law_task
 
 
 @dataclass
@@ -49,12 +50,21 @@ class SubmitOptions:
             )
         if self.safety_margin > 0 and not self.resubmit:
             raise ConfigError("--safety-margin needs follower hops; it cannot be combined with --no-resubmit")
-        if not self.wait and self.retries:
-            raise ConfigError("--retries requires --wait; non-polling law cannot perform controller-side retries")
+        if not self.wait and not self.supervisor_job and self.retries:
+            raise ConfigError(
+                "--retries requires --wait or --supervisor-job: something must run law again to resubmit failed jobs"
+            )
         if self.scratch not in (None, "beegfs", "ssd"):
             raise ConfigError("--scratch must be 'beegfs' or 'ssd'")
         if self.supervisor_job and (self.supervisor_interval < 60 or self.supervisor_max_rounds < 1):
             raise ConfigError("--supervisor-interval must be >= 60 s and --supervisor-rounds >= 1")
+
+    def law_retries(self) -> int:
+        """law's resubmissions per failed job.  The supervisor's passes let law retry (``--supervisor-rounds`` times
+        unless ``--retries`` says otherwise); --safety-margin is the alternative, in-chain mechanism."""
+        if self.retries or self.wait or not self.supervisor_job or self.safety_margin > 0:
+            return self.retries
+        return self.supervisor_max_rounds
 
     def failure_budget(self) -> int:
         return 0 if self.safety_margin <= 0 else max(1, math.ceil(self.safety_margin * self.tasks_per_job))
@@ -106,15 +116,17 @@ def describe_policy(config: dict[str, Any], opts: SubmitOptions, scratch_kind: s
     if opts.max_concurrent:
         lines.append(f"[submit] concurrency at most {opts.max_concurrent} chain lane(s) (continuation hops may overlap briefly)")
     else:
-        lines.append("[submit] concurrency not capped (use --max-concurrent N or --wait --parallel-jobs N)")
+        lines.append("[submit] concurrency not capped (use --max-concurrent N or --parallel-jobs N with --supervisor-job)")
     if opts.retry_payload:
         lines.append(f"[submit] retry       payload up to {opts.retry_payload}x inside a job (time-aware)")
     if opts.safety_margin:
         lines.append(f"[submit] retry       safety margin {opts.safety_margin}: {opts.failure_budget()} extra retry hop(s) per chain")
-    if opts.retries:
-        lines.append(f"[submit] retry       law retries {opts.retries} (controller must stay alive)")
+    retries = opts.law_retries()
+    if retries:
+        driver = "the waiting controller" if opts.wait else "the supervisor's law passes"
+        lines.append(f"[submit] retry       law resubmits a failed job up to {retries}x ({driver})")
     if opts.supervisor_job:
-        lines.append(f"[submit] supervisor  every {opts.supervisor_interval}s, at most {opts.supervisor_max_rounds} resume round(s)")
+        lines.append(f"[submit] supervisor  a law pass every {opts.supervisor_interval}s until done (or no retries left)")
     return lines
 
 
@@ -142,13 +154,17 @@ def submit_manifest_run(
     cache_dir = Path(config["execution"]["cache_dir"])
     manifest = load_manifest(manifest_source)
     branches = len(manifest["branches"])
-    if manifest.get("finalize"):
-        raise ConfigError("this humsub version cannot run a manifest's finalize step yet; remove the finalize section")
+    finalize = manifest.get("finalize")
+    if finalize and not opts.wait and not opts.supervisor_job and allow_supervisor:
+        # the finalize workflow is submitted by a law pass once every branch is done: something must run those passes
+        opts.supervisor_job = True
+        opts.validate()
+        print("[submit] note: the manifest has a finalize step, so the supervisor job (law passes) is switched on")
 
-    if not opts.wait and opts.parallel_jobs and branches > opts.parallel_jobs:
+    if not opts.wait and not opts.supervisor_job and opts.parallel_jobs and branches > opts.parallel_jobs:
         raise ConfigError(
-            "manifest contains more branches than --parallel-jobs, but --wait was not set; "
-            "use --wait for rolling submission or --parallel-jobs=0 to submit all branches immediately"
+            "manifest contains more branches than --parallel-jobs, but neither --wait nor --supervisor-job was set; "
+            "use one of them for rolling submission or --parallel-jobs=0 to submit all branches immediately"
         )
 
     if not skip_path_checks:
@@ -159,6 +175,8 @@ def submit_manifest_run(
                 check_compute_writable(Path(output), f"branch {branch['id']} output", must_be_shared=True)
             for output in branch.get("extra_outputs", []):
                 check_compute_writable(Path(output), f"branch {branch['id']} extra output", must_be_shared=True)
+        for output in (finalize or {}).get("outputs", []):
+            check_compute_writable(Path(output), "finalize output", must_be_shared=True)
     else:
         print("[submit] WARNING: filesystem/path validation disabled by --skip-path-checks", file=sys.stderr)
 
@@ -190,6 +208,9 @@ def submit_manifest_run(
         print(f"[submit] config      {', '.join(map(str, sources))}")
     for line in describe_policy(config, opts, scratch_kind):
         print(line)
+    if finalize:
+        print(f"[submit] finalize    a law workflow after all branches ({len(finalize['outputs'])} output(s)), "
+              "submitted by the first pass that finds every branch done")
     if quota_line:
         print(f"[submit] {quota_line}")
     if dry_run:
@@ -240,30 +261,35 @@ def submit_manifest_run(
             "manifest": spec["manifest_workflow"]["manifest"],
             "payload": spec["manifest_workflow"]["payload"],
         }
+        # The law tasks: the branch workflow and the top task that every supervisor pass re-instantiates identically
+        # (hummel_submit.tick); with a finalize step the top task is the finalize workflow, which requires the branches.
+        law_opts = dict(opts.to_dict(), retries=opts.law_retries())
+        branch_task = manifest_law_task(spec_path, law_opts)
+        spec["manifest_workflow"]["branch_task"] = branch_task
+        spec["law_task"] = (
+            manifest_law_task(spec_path, dict(law_opts, tasks_per_job=1, parallel_jobs=0), "ManifestFinalizeWorkflow")
+            if finalize else branch_task
+        )
         atomic_write_json(spec_path, spec)
 
         try:
             import luigi
-            from .manifest_workflow import ManifestPayloadWorkflow
+            from .tick import instantiate
         except ImportError as exc:
             raise ConfigError(
                 "law (master) is required for manifest submission; reinstall hummel-submit with its dependencies"
             ) from exc
 
-        task = ManifestPayloadWorkflow(
-            humsub_spec=str(spec_path),
-            workflow="slurm",
-            no_poll=not opts.wait,
-            retries=opts.retries,
-            tasks_per_job=opts.tasks_per_job,
-            parallel_jobs=opts.parallel_jobs,
-            job_workers=1,
-        )
+        # Without --wait only the branches can start now; the passes take it from there.  A waiting controller
+        # polls through the whole graph (finalize included).
+        task = instantiate(spec["law_task"] if opts.wait else branch_task)
+        task.no_poll = not opts.wait
         success = luigi.build([task], local_scheduler=True, workers=1)
         if not success:
             raise ConfigError("law failed to prepare/submit the manifest workflow")
         spec = load_submission_spec(spec_path)
-        if not spec.get("chain_ids") and all_outputs_exist(manifest):
+        finalize_pending = bool(finalize) and not all(Path(o).exists() for o in finalize["outputs"])
+        if not spec.get("chain_ids") and all_outputs_exist(manifest) and not finalize_pending:
             discard_preparation(staged_root, spec_path, spec)
             print(f"[submit] all {branches} branches already have their outputs; nothing to submit")
             return None
@@ -278,7 +304,11 @@ def submit_manifest_run(
             discard_preparation(staged_root, spec_path, spec)
         raise
 
-    print_manifest_submission(spec, output_dir, wait=opts.wait)
+    if spec.get("chain_ids") or not finalize:
+        print_manifest_submission(spec, output_dir, wait=opts.wait)
+    else:
+        print(f"[submit] submission  {spec['submission_id']}")
+        print(f"[submit] all {branches} branches already have their outputs; only the finalize step is left")
     if opts.supervisor_job and allow_supervisor:
         from .supervisor import submit_supervisor
         job_id = submit_supervisor(spec_path, round_no=1)

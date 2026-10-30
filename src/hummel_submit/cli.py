@@ -48,6 +48,7 @@ from .prune import apply_plan, fmt as fmt_size, plan_submission, select_submissi
 from .stats import format_stats, stats_for, to_json as stats_json
 from .lineage import (
     compute_overview,
+    finalize_state,
     find_submission,
     format_overview,
     resume as resume_lineage,
@@ -213,6 +214,13 @@ def _parser() -> argparse.ArgumentParser:
                       help="output of the finalize step, run once all branches are done (repeatable)")
     make.add_argument("--finalize-data-json", metavar="JSON", help="data of the finalize step (e.g. its own command)")
     make.add_argument("-o", "--manifest", type=Path, required=True, help="manifest file to write")
+
+    tick = sub.add_parser(
+        "tick",
+        help="one pass of law over a submission: poll its jobs once, resubmit failed ones within --retries, submit "
+             "pending ones (what the supervisor job does periodically)",
+    )
+    tick.add_argument("submission", help="submission id or run name")
 
     sub.add_parser("help", help="show this help message")
 
@@ -586,6 +594,25 @@ def cmd_make_manifest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tick(args: argparse.Namespace) -> int:
+    from .tick import run_tick
+
+    config, _ = load_config(Path.cwd(), require_command=False)
+    output_dir = Path(config["execution"]["output_dir"])
+    spec_path = find_submission(output_dir, args.submission)
+    result = run_tick(spec_path)
+    print(f"[tick] {result.state}")
+    for error in result.errors:
+        print(f"[tick]   {error}")
+    spec = load_submission_spec(spec_path)
+    for line in format_overview(compute_overview(output_dir, spec), hint=False):
+        print(f"[tick] {line}")
+    finalize = finalize_state(spec)
+    if finalize:
+        print(f"[tick] finalize:   {finalize}")
+    return {"complete": 0, "progress": 0, "busy": 3, "failed": 1}[result.state]
+
+
 def cmd_resume(args: argparse.Namespace) -> int:
     config, _ = load_config(Path.cwd(), require_command=False)
     output_dir = Path(config["execution"]["output_dir"])
@@ -700,6 +727,9 @@ def cmd_submission_status(args: argparse.Namespace) -> int:
     print()
     for line in format_overview(compute_overview(output_dir, spec)):
         print(line)
+    finalize = finalize_state(spec)
+    if finalize:
+        print(f"finalize:   {finalize}")
     return 0
 
 
@@ -926,6 +956,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_make_manifest(args)
         if args.subcommand == "resume":
             return cmd_resume(args)
+        if args.subcommand == "tick":
+            return cmd_tick(args)
         if args.subcommand == "status":
             return cmd_status(args)
         if args.subcommand == "follow":

@@ -134,6 +134,29 @@ def compute_overview(output_dir: Path, spec: dict[str, Any]) -> Overview:
     )
 
 
+def finalize_state(spec: dict[str, Any]) -> str | None:
+    """One line on the manifest's finalize step (None without one), from its outputs and law's jobs file."""
+    fin = root_manifest(spec).get("finalize")
+    if not fin:
+        return None
+    if all(Path(o).exists() for o in fin["outputs"]):
+        return "done"
+    jobs: dict[str, Any] = {}
+    attempts = 0
+    for control in sorted((Path(spec.get("law_dir", "")) / "control" / "finalize").glob("slurm_jobs_*.json")):
+        try:
+            data = json.loads(control.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        jobs.update(data.get("jobs", {}))
+        attempts += sum(int(n) for n in data.get("attempts", {}).values())
+    if not jobs:
+        return "waiting for the branches (the first law pass that finds them all done submits it)"
+    job = next(iter(jobs.values()))
+    status = job.get("status") or "submitted"  # law fills it in at its first poll
+    return f"chain {job.get('job_id')} {status} ({attempts} retr{'y' if attempts == 1 else 'ies'})"
+
+
 def format_overview(ov: Overview, *, hint: bool = True) -> list[str]:
     lines = [
         f"lineage:    {ov.lineage_id} ({len(ov.submissions)} submission(s): {', '.join(ov.submissions)})",
@@ -241,6 +264,10 @@ def resume(
     resume_dir.mkdir(exist_ok=True)
     subset = dict(manifest)
     subset["branches"] = [b for b in manifest["branches"] if int(b["id"]) in wanted]
+    if subset.pop("finalize", None):
+        # a resume covers only some branches: its own finalize could run before the others are done
+        print(f"[resume] the finalize step stays with the original submission: its supervisor or "
+              f"`humsub tick {lineage_id(base)}` submits it once every branch is done")
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     manifest_path = resume_dir / f"manifest-{stamp}.json"
     manifest_path.write_text(json.dumps(subset, indent=1), encoding="utf-8")

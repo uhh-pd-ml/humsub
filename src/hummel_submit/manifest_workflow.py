@@ -10,6 +10,7 @@ import threading
 import time
 
 import law
+from law.target.local import LocalDirectoryTarget
 
 from .contrib.hummel import HummelWorkflow
 from .scratch import (
@@ -59,6 +60,10 @@ class ManifestPayloadWorkflow(HummelWorkflow, law.LocalWorkflow):
         targets = [law.LocalFileTarget(path) for path in self.branch_data["outputs"]]
         return targets[0] if len(targets) == 1 else targets
 
+    def _branch_context(self, workflow) -> tuple[int | str, Path]:
+        """(label used for HUMSUB_BRANCH, scratch and leftovers; frozen context file) of this branch."""
+        return int(self.branch), Path(workflow["branch_files"][str(int(self.branch))])
+
     def run(self):
         soft_file = os.environ.get("HUMSUB_SOFT_STOP_FILE")
         if soft_file and Path(soft_file).exists():
@@ -67,8 +72,7 @@ class ManifestPayloadWorkflow(HummelWorkflow, law.LocalWorkflow):
             raise RuntimeError("soft-stop notice already given: branch not started, the next hop runs it")
         spec = self._spec()
         workflow = self._workflow()
-        branch_id = int(self.branch)
-        branch_file = Path(workflow["branch_files"][str(branch_id)])
+        branch_id, branch_file = self._branch_context(workflow)
         payload = Path(workflow["payload"])
 
         targets = self.output()
@@ -185,6 +189,32 @@ class ManifestPayloadWorkflow(HummelWorkflow, law.LocalWorkflow):
             remove_scratch(dirs)
             if previous is not None:
                 signal.signal(signal.SIGTERM, previous)
+
+
+class ManifestFinalizeWorkflow(ManifestPayloadWorkflow):
+    """The manifest's ``finalize`` step: one branch that runs the payload once every manifest branch is complete.
+
+    It is a law workflow of its own whose ``workflow_requires`` is the branch workflow, so law (driven by the
+    supervisor's passes) submits it only when all branch outputs exist, polls and retries it like any other job.
+    The branch task inside the job has no requirements: it never re-runs the branches.
+    """
+
+    def create_branch_map(self):
+        return {0: self._manifest()["finalize"]}
+
+    def workflow_requires(self):
+        from .tick import instantiate
+
+        reqs = super().workflow_requires()
+        reqs["branches"] = instantiate(self._workflow()["branch_task"])
+        return reqs
+
+    def slurm_output_directory(self):
+        # law names jobs files after the branch range only: keep them apart from the branch workflow's
+        return LocalDirectoryTarget(str(Path(self._spec()["law_dir"]) / "control" / "finalize"))
+
+    def _branch_context(self, workflow) -> tuple[int | str, Path]:
+        return "finalize", Path(workflow["finalize_file"])
 
 
 def _wait_with_grace(proc: subprocess.Popen, interrupted: threading.Event, grace: float = 45.0) -> int:

@@ -1,16 +1,27 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 import luigi
 from law.contrib.slurm.job import SlurmJobFileFactory
-from law.contrib.slurm.workflow import SlurmWorkflow
+from law.contrib.slurm.workflow import SlurmWorkflow, SlurmWorkflowProxy
 from law.job.base import JobInputFile
 from law.target.local import LocalDirectoryTarget
 
 from .job import HummelJobManager
 from ...submission import load_submission_spec
+from ...tick import TICK_ENV
+
+
+class HummelWorkflowProxy(SlurmWorkflowProxy):
+    def poll(self) -> None:
+        # law counts retries in memory only (``_job_retries``) but persists ``attempts`` in the jobs file.  A pass is a
+        # fresh process, so without this every pass would grant ``retries`` new attempts, i.e. retry forever.
+        for job_num, attempts in self.job_data.attempts.items():
+            self._job_retries[int(job_num)] = max(self._job_retries[int(job_num)], int(attempts))
+        super().poll()
 
 
 class HummelWorkflow(SlurmWorkflow):
@@ -21,11 +32,23 @@ class HummelWorkflow(SlurmWorkflow):
     persistent output filesystem and handed to :class:`HummelJobManager`, which
     wraps each one in an autonomous Hummel chain and returns a stable chain id to
     law.
+
+    The workflow is driven by *passes* (:mod:`hummel_submit.tick`): law re-run with ``no_poll`` on an existing
+    submission polls once, resubmits failed jobs within ``retries``, submits pending ones and returns.
     """
+
+    workflow_proxy_cls = HummelWorkflowProxy
 
     humsub_spec = luigi.Parameter(
         description="absolute path to the frozen humsub submission specification",
     )
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # ``no_poll`` is not passed on by law's req() (exclude_params_req_set), so a workflow required by another task
+        # would poll in a blocking loop; inside a pass every Hummel workflow polls exactly once instead.
+        if os.environ.get(TICK_ENV) == "1":
+            self.no_poll = True
 
     # HummelJobManager handles actual queue interaction.  Keep all law-generated
     # job files persistent because autonomous successor jobs may need them long
