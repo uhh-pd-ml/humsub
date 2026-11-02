@@ -13,6 +13,7 @@ import law
 from law.target.local import LocalDirectoryTarget
 
 from .contrib.hummel import HummelWorkflow
+from .manifest import output_groups
 from .scratch import (
     effective_scratch_kind,
     hop_timing,
@@ -77,12 +78,12 @@ class ManifestPayloadWorkflow(HummelWorkflow, law.LocalWorkflow):
 
         targets = self.output()
         target_list = targets if isinstance(targets, list) else [targets]
+        groups = output_groups(self.branch_data)
 
         def clear_outputs() -> None:
-            # Only a branch that law considers incomplete runs; remove any partial subset left by
-            # a previous failed attempt before invoking the application payload again.
-            for target in target_list:
-                Path(target.path).unlink(missing_ok=True)
+            # Only a branch that law considers incomplete runs; remove any partial subset left by a previous failed
+            # attempt before invoking the application payload again.
+            clear_incomplete_outputs(groups)
 
         clear_outputs()
 
@@ -215,6 +216,20 @@ class ManifestFinalizeWorkflow(ManifestPayloadWorkflow):
 
     def _branch_context(self, workflow) -> tuple[int | str, Path]:
         return "finalize", Path(workflow["finalize_file"])
+
+
+def clear_incomplete_outputs(groups: list[list[str]]) -> None:
+    """Remove the outputs of a failed (or not yet run) branch, group by group.
+
+    A group whose outputs all exist is complete and kept (e.g. one input file of several in the branch: a payload that
+    skips finished inputs then only redoes the rest); any other group is removed.  If every group is complete, the
+    attempt still failed (e.g. exit != 0 after writing them all): then nothing is kept, or the failed branch would
+    look complete.  Without ``output_groups`` the branch is one group, so this is all-or-nothing."""
+    complete = [all(Path(p).exists() for p in group) for group in groups]
+    for group, done in zip(groups, complete):
+        if not done or all(complete):
+            for p in group:
+                Path(p).unlink(missing_ok=True)
 
 
 def _wait_with_grace(proc: subprocess.Popen, interrupted: threading.Event, grace: float = 45.0) -> int:

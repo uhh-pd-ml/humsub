@@ -99,7 +99,9 @@ def build_manifest(
         "schema": 1,
         "common": dict(common or {}, **values),
         "branches": [
-            {"id": i, "data": {"inputs": [str(p) for p in chunk]}, "outputs": [o for p in chunk for o in outputs_of[p]]}
+            # one output group per input: when a later input of the branch fails, the earlier inputs' outputs are kept
+            {"id": i, "data": {"inputs": [str(p) for p in chunk]}, "outputs": [o for p in chunk for o in outputs_of[p]],
+             "output_groups": [outputs_of[p] for p in chunk]}
             for i, chunk in enumerate(chunks)
         ],
     }

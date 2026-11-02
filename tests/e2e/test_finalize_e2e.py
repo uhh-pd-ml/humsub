@@ -56,6 +56,13 @@ def _setup(project, n: int, *, fail_once: tuple[int, ...] = (), broken: Path | N
     return path, project.write_payload(PAYLOAD), res
 
 
+def _assert_no_false_finalize_failures(project) -> None:
+    # a pass while branches are incomplete must not even try the finalize step: luigi would log it as a failure
+    # ("Unfulfilled dependency at run time", "This progress looks :(") although it only means "not yet"
+    logs = _logs(project)
+    assert "Unfulfilled" not in logs and "looks :(" not in logs, logs[-3000:]
+
+
 def _wait_for(path: Path, timeout: int, project, what: str) -> None:
     deadline = time.time() + timeout
     while not path.exists() and time.time() < deadline:
@@ -82,6 +89,7 @@ def test_finalize_runs_once_after_all_branches(project):
     _wait_for_log(project, "pass complete -> done", 150)
     status = project.humsub("submission-status", sub.id, check=True).stdout
     assert "4 done" in status and "finalize:   done" in status, status
+    _assert_no_false_finalize_failures(project)
 
 
 @pytest.mark.supervisor
@@ -94,6 +102,7 @@ def test_finalize_waits_for_a_retried_branch(project):
     assert (res / "sum.txt").read_text() == "111"
     assert not (res / "EARLY").exists(), (res / "EARLY").read_text()
     _wait_for_log(project, "pass complete -> done", 150)
+    _assert_no_false_finalize_failures(project)
 
 
 @pytest.mark.supervisor

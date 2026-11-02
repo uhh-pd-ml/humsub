@@ -94,6 +94,51 @@ def test_failing_payload_fails_chain_and_leaves_no_partial_output(project):
     assert project.squeue().strip() == "", project.squeue()
 
 
+def test_a_failing_input_keeps_the_outputs_of_the_finished_inputs_of_its_branch(project):
+    """make-manifest packs inputs into branches with one output group per input: when the third of four inputs fails,
+    the first two keep their outputs, and a resubmission after the fix only redoes the rest (the payload skips
+    inputs whose outputs exist, like the COLLIDE-2V converter)."""
+    raw, res = project.dir / "raw", project.dir / "results"
+    raw.mkdir(), res.mkdir()
+    for i in range(4):
+        (raw / f"x{i}.txt").write_text(str(i))
+    broken = project.dir / "x2-is-broken"
+    broken.write_text("")
+    done_log = project.dir / "processed.log"
+    payload = project.write_payload(f"""
+        import json, sys
+        from pathlib import Path
+        ctx = json.loads(Path(sys.argv[1]).read_text())
+        out = Path(ctx["common"]["out"])
+        for inp in map(Path, ctx["data"]["inputs"]):
+            a, b = out / (inp.stem + ".a"), out / (inp.stem + ".b")
+            if a.exists() and b.exists():
+                continue
+            a.write_text("a")                                   # the first output of the input
+            if inp.stem == "x2" and Path({str(broken)!r}).exists():
+                sys.exit(5)                                     # crash before its second output
+            b.write_text("b")
+            with open({str(done_log)!r}, "a") as log:
+                log.write(inp.stem + "\\n")
+    """)
+    manifest = project.dir / "manifest.json"
+    project.humsub("make-manifest", "--search", str(raw), "--glob", "*.txt", "--output", "{out}/{stem}.a",
+                   "--output", "{out}/{stem}.b", "--set", f"out={res}", "--files-per-branch", "4",
+                   "-o", str(manifest), check=True)
+    assert len(json.loads(manifest.read_text())["branches"][0]["output_groups"]) == 4
+
+    first = project.submit(manifest, payload, "groups-1")
+    assert list(first.wait().values()) == ["failed"], first.text
+    assert sorted(p.name for p in res.iterdir()) == ["x0.a", "x0.b", "x1.a", "x1.b"], \
+        "the finished inputs keep their outputs, the partial one (x2.a) is removed"
+
+    broken.unlink()
+    second = project.submit(manifest, payload, "groups-2")
+    assert list(second.wait().values()) == ["finished"], second.text
+    assert sorted(p.name for p in res.iterdir()) == [f"x{i}.{x}" for i in range(4) for x in "ab"]
+    assert done_log.read_text().split() == ["x0", "x1", "x2", "x3"], "x0 and x1 are converted only once"
+
+
 def test_exit_zero_without_output_is_a_failure(project):
     out = project.dir / "results" / "o.json"
     (project.dir / "results").mkdir()
