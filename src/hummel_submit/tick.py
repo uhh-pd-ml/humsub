@@ -109,6 +109,24 @@ def _is_waiting(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "Unfulfilled" in str(exc)
 
 
+def _frontier(task) -> list:  # noqa: ANN001
+    """The tasks a pass builds: *task* itself once its requirements are complete, else (recursively) its incomplete
+    requirements.  In a pass a workflow's run() only submits and returns, so luigi takes it for done and would go on to
+    run the tasks that require it, which then fail with "Unfulfilled dependency" (logged as an error, though it only
+    means "not yet"); building the frontier lets the downstream tasks wait for a later pass instead."""
+    from luigi.task import flatten
+
+    if task.complete():
+        return [task]
+    incomplete = [req for req in flatten(task.requires()) if not req.complete()]
+    if not incomplete:
+        return [task]
+    frontier: list = []
+    for req in incomplete:
+        frontier += [t for t in _frontier(req) if t not in frontier]
+    return frontier
+
+
 @contextmanager
 def _tick_env() -> Iterator[None]:
     previous = os.environ.get(TICK_ENV)
@@ -142,7 +160,7 @@ def run_tick(spec_path: Path, purpose: str = "law pass") -> TickResult:
             _install_failure_handler()
             _failures.clear()
             task = instantiate(law_task_of(spec_path, spec))
-            luigi.build([task], local_scheduler=True, workers=1)
+            luigi.build(_frontier(task), local_scheduler=True, workers=1)
             complete = task.complete()
     finally:
         lock.release()

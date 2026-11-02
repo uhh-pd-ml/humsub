@@ -101,6 +101,13 @@ humsub cleanup SUBMISSION_ID             # delete the staged inputs on the SSD o
   `/tmp` and `/dev/shm` are rejected at submission).  **A branch is complete exactly when all of its outputs
   exist.**  This is law's completeness test, so it also makes submission idempotent: re-submitting a
   manifest launches only branches with missing outputs, and says "nothing to submit" if none are missing.
+* `output_groups` (optional) splits `outputs` into groups that are complete together, every output in exactly one group,
+  e.g. one group per input file when several inputs share a branch:
+  `"output_groups": [["/beegfs/.../a.json", "/beegfs/.../a.parquet"], ["/beegfs/.../b.json", "/beegfs/.../b.parquet"]]`.
+  When the branch fails, the groups whose outputs all exist are **kept** and only the incomplete ones are deleted, so a
+  payload that skips inputs whose outputs exist redoes only the rest.  (If every group exists after a failed attempt,
+  nothing is kept: the failure must not look like success.)  Without it the branch is one group: all or nothing.
+  `make-manifest` writes one group per input.
 * `extra_outputs` (optional, same path rules, files **or directories**) are results that are good to have but **not part of the
   contract**: debug files, logs, and above all **checkpoints**.  humsub never counts them for completion, **never deletes them**
   (required outputs are wiped before every attempt and after every failure; extra outputs are not), never cleans them up, and lists
@@ -140,7 +147,8 @@ humsub make-manifest --search /beegfs/.../raw --glob '*.parquet' \
   that would write the same output are an error;
 * `--files-per-branch K` packs K inputs into one branch (`data.inputs`): one payload run handles all of them.  Prefer this over
   `--tasks-per-job` when every payload start is expensive (container start, imports): `--tasks-per-job` still starts the
-  payload once per branch;
+  payload once per branch.  Each input's outputs form one `output_groups` entry, so when an input fails, the inputs
+  finished before it keep their outputs; a payload that skips inputs whose outputs exist then only redoes the rest;
 * `--set KEY=VALUE`, `--common FILE`, `--common-json JSON` fill `common`; `--finalize-output`/`--finalize-data-json` add a
   `finalize` step.
 
@@ -182,7 +190,8 @@ Rules:
 
 1. **Exit 0 and create every declared output**, otherwise the branch fails (or is re-run, see `--retry-payload`).
    Before each run `humsub` deletes any outputs left by a failed attempt, and after a failure it deletes whatever
-   the payload wrote to the declared paths, so a partial output cannot make a retry look complete.  After a failed
+   the payload wrote to the declared paths, so a partial output cannot make a retry look complete (with `output_groups`:
+   only the incomplete groups, see the manifest format).  After a failed
    or interrupted branch only a few small text files of the scratch (≤ 1 MiB each, ≤ 20 files) are kept, in
    `<run_dir>/leftovers/<jobid>-<branch>/`; the scratch itself is removed.
 2. **Write atomically** (temporary name next to the target, then rename): scratch and the declared outputs may be
@@ -483,7 +492,8 @@ The same in every mechanism, because it is defined by the manifest, not by the c
 * **Branches whose outputs exist are never re-run** (law skips them within a job of several branches, `--tasks-per-job`).
 * **The failed branch starts from the beginning**: its declared outputs are deleted before every attempt, and its
   scratch (`HUMSUB_SCRATCH`, `HUMSUB_SCRATCH_FAST`) is removed when it fails (a few small text files are kept in
-  `<run_dir>/leftovers/` for diagnosis).
+  `<run_dir>/leftovers/` for diagnosis).  With `output_groups` (e.g. from `make-manifest`), the complete groups are kept
+  and only the incomplete ones are deleted.
 * **`extra_outputs` survive**, at the same fixed paths: they are the place for **checkpoints**.  A payload that
   checkpoints there resumes from the checkpoint after any kind of retry (in-job, follower hop, law, `resume`) and after
   a time-limit continuation; one that keeps its state in the scratch or derives it from `HUMSUB_HOP` does not.

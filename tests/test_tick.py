@@ -64,6 +64,62 @@ def test_pass_outcomes(tmp_path: Path, cls, state) -> None:
     assert tick.TICK_ENV not in os.environ
 
 
+class Ran:
+    tasks: list[str] = []
+
+
+class Submitting(luigi.Task):
+    """Like a Hummel workflow in a pass: run() submits and returns, the outputs come later."""
+
+    def complete(self) -> bool:
+        return False
+
+    def run(self) -> None:
+        Ran.tasks.append("submitting")
+
+
+class Finalize(luigi.Task):
+    def requires(self):
+        return Submitting()
+
+    def complete(self) -> bool:
+        return False
+
+    def run(self) -> None:
+        Ran.tasks.append("finalize")
+
+
+class FinalizeAfterDone(Finalize):
+    def requires(self):
+        return Done()
+
+
+def test_a_pass_does_not_try_the_finalize_step_while_its_branches_are_incomplete(tmp_path: Path) -> None:
+    # luigi would take the submitting workflow for done and then fail the finalize step with "Unfulfilled
+    # dependency" (an ERROR traceback and "looks :(" in every supervisor log); the pass builds only the frontier
+    Ran.tasks = []
+    with patch.object(tick, "instantiate", return_value=Finalize()):
+        result = tick.run_tick(_spec(tmp_path))
+    assert result.state == "progress" and result.errors == []
+    assert Ran.tasks == ["submitting"]
+    assert tick._failures == []
+
+
+def test_a_pass_runs_the_finalize_step_once_its_branches_are_complete(tmp_path: Path) -> None:
+    Ran.tasks = []
+    with patch.object(tick, "instantiate", return_value=FinalizeAfterDone()):
+        tick.run_tick(_spec(tmp_path))
+    assert Ran.tasks == ["finalize"]
+
+
+def test_frontier_recurses_into_incomplete_requirements() -> None:
+    assert tick._frontier(Done()) == [Done()]
+    assert tick._frontier(Waiting()) == [Waiting()]
+    assert tick._frontier(Finalize()) == [Submitting()]
+    assert tick._frontier(FinalizeAfterDone()) == [FinalizeAfterDone()]
+    assert tick._frontier(Downstream()) == [Waiting()]
+
+
 def test_a_pass_backs_off_while_someone_else_holds_the_control_lock(tmp_path: Path) -> None:
     spec_path = _spec(tmp_path)
     (spec_path.parent / "control.lock").write_text(json.dumps(
