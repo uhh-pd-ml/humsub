@@ -58,8 +58,10 @@ def _setup(project, n: int, *, fail_once: tuple[int, ...] = (), broken: Path | N
 
 def _assert_no_false_finalize_failures(project) -> None:
     # a pass while branches are incomplete must not even try the finalize step: luigi would log it as a failure
-    # ("Unfulfilled dependency at run time", "This progress looks :(") although it only means "not yet"
-    logs = _logs(project)
+    # ("Unfulfilled dependency at run time", "This progress looks :(") although it only means "not yet".  Only the
+    # supervisor's passes: a branch job whose payload fails rightly reports its failure.
+    logs = "".join(p.read_text(errors="replace") for p in sorted((project.out / "logs").glob("*supervisor*.log")))
+    assert logs, "no supervisor logs"
     assert "Unfulfilled" not in logs and "looks :(" not in logs, logs[-3000:]
 
 
