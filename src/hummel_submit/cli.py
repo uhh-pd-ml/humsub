@@ -209,6 +209,9 @@ def _parser() -> argparse.ArgumentParser:
     make.add_argument("--search", type=Path, action="append", required=True, metavar="DIR",
                       help="folder searched recursively (repeatable)")
     make.add_argument("--glob", default="*", help="file name pattern of the inputs (default: *)")
+    make.add_argument("--include-hidden", action="store_true",
+                      help="also search hidden files and folders (name starts with '.'; skipped by default: partial "
+                           "downloads such as .rsync-partial/ and tool state)")
     make.add_argument("--require", metavar="REGEX", help="every file name found must fullmatch this, else stop")
     make.add_argument("--select", metavar="REGEX", help="only file names that fullmatch this become inputs")
     make.add_argument("--output", action="append", required=True, metavar="TEMPLATE",
@@ -594,7 +597,8 @@ def cmd_make_manifest(args: argparse.Namespace) -> int:
         common.update(json_object(args.common.read_text(encoding="utf-8"), str(args.common)))
     if args.common_json:
         common.update(json_object(args.common_json, "--common-json"))
-    files, found = find_inputs(args.search, args.glob, require=args.require, select=args.select)
+    files, found = find_inputs(args.search, args.glob, require=args.require, select=args.select,
+                               include_hidden=args.include_hidden)
     manifest = build_manifest(
         files,
         outputs=args.output,
