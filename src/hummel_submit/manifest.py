@@ -90,6 +90,8 @@ def load_manifest(path: Path) -> dict[str, Any]:
         }
         if normalized_extra:
             entry["extra_outputs"] = normalized_extra
+        if "output_groups" in branch:
+            entry["output_groups"] = _load_output_groups(branch["output_groups"], normalized_outputs, branch_id)
         normalized.append(entry)
 
     result = {
@@ -102,6 +104,27 @@ def load_manifest(path: Path) -> dict[str, Any]:
     if "finalize" in data:
         result["finalize"] = _load_finalize(data["finalize"], normalized)
     return result
+
+
+def _load_output_groups(groups: Any, outputs: list[str], branch_id: int) -> list[list[str]]:
+    """Optional ``output_groups``: the branch's outputs split into groups that are complete together (e.g. the outputs of
+    one input file when several inputs share a branch).  Every output is in exactly one group."""
+    if not isinstance(groups, list) or not groups:
+        raise ManifestError(f"branch {branch_id} output_groups must be a non-empty array of arrays")
+    normalized: list[list[str]] = []
+    for group in groups:
+        if not isinstance(group, list) or not group or not all(isinstance(o, str) and o for o in group):
+            raise ManifestError(f"branch {branch_id} output_groups must be non-empty arrays of output paths")
+        normalized.append([str(Path(o).expanduser()) for o in group])
+    flat = [o for group in normalized for o in group]
+    if sorted(flat) != sorted(outputs):
+        raise ManifestError(f"branch {branch_id}: output_groups must contain every output exactly once")
+    return normalized
+
+
+def output_groups(branch: dict[str, Any]) -> list[list[str]]:
+    """The branch's output groups; without ``output_groups`` all outputs form one group."""
+    return branch.get("output_groups") or [list(branch["outputs"])]
 
 
 def _load_finalize(fin: Any, branches: list[dict[str, Any]]) -> dict[str, Any]:
